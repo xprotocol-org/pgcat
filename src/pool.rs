@@ -1,5 +1,4 @@
 use arc_swap::ArcSwap;
-use async_trait::async_trait;
 use bb8::{ManageConnection, Pool, PooledConnection, QueueStrategy};
 use chrono::naive::NaiveDateTime;
 use log::{debug, error, info, warn};
@@ -992,9 +991,9 @@ impl ConnectionPool {
                 let now = chrono::offset::Utc::now().naive_utc();
                 match ban_reason {
                     BanReason::AdminBan(duration) => {
-                        now.timestamp() - timestamp.timestamp() > *duration
+                        now.and_utc().timestamp() - timestamp.and_utc().timestamp() > *duration
                     }
-                    _ => now.timestamp() - timestamp.timestamp() > self.settings.ban_time,
+                    _ => now.and_utc().timestamp() - timestamp.and_utc().timestamp() > self.settings.ban_time,
                 }
             }
             None => return true,
@@ -1176,65 +1175,75 @@ impl ServerPool {
     }
 }
 
-#[async_trait]
 impl ManageConnection for ServerPool {
     type Connection = Server;
     type Error = Error;
 
-    /// Attempts to create a new connection.
-    async fn connect(&self) -> Result<Self::Connection, Self::Error> {
-        info!("Creating a new server connection {:?}", self.address);
+    fn connect(&self) -> impl std::future::Future<Output = Result<Self::Connection, Self::Error>> + Send {
+        let address = self.address.clone();
+        let user = self.user.clone();
+        let database = self.database.clone();
+        let client_server_map = self.client_server_map.clone();
+        let auth_hash = self.auth_hash.clone();
+        let cleanup_connections = self.cleanup_connections;
+        let log_client_parameter_status_changes = self.log_client_parameter_status_changes;
+        let prepared_statement_cache_size = self.prepared_statement_cache_size;
+        let plugins = self.plugins.clone();
 
-        let stats = Arc::new(ServerStats::new(
-            self.address.clone(),
-            tokio::time::Instant::now(),
-        ));
+        async move {
+            info!("Creating a new server connection {:?}", address);
 
-        stats.register(stats.clone());
+            let stats = Arc::new(ServerStats::new(
+                address.clone(),
+                tokio::time::Instant::now(),
+            ));
 
-        // Connect to the PostgreSQL server.
-        match Server::startup(
-            &self.address,
-            &self.user,
-            &self.database,
-            self.client_server_map.clone(),
-            stats.clone(),
-            self.auth_hash.clone(),
-            self.cleanup_connections,
-            self.log_client_parameter_status_changes,
-            self.prepared_statement_cache_size,
-        )
-        .await
-        {
-            Ok(mut conn) => {
-                if let Some(ref plugins) = self.plugins {
-                    if let Some(ref prewarmer) = plugins.prewarmer {
-                        let mut prewarmer = prewarmer::Prewarmer {
-                            enabled: prewarmer.enabled,
-                            server: &mut conn,
-                            queries: &prewarmer.queries,
-                        };
+            stats.register(stats.clone());
 
-                        prewarmer.run().await?;
+            match Server::startup(
+                &address,
+                &user,
+                &database,
+                client_server_map,
+                stats.clone(),
+                auth_hash,
+                cleanup_connections,
+                log_client_parameter_status_changes,
+                prepared_statement_cache_size,
+            )
+            .await
+            {
+                Ok(mut conn) => {
+                    if let Some(ref plugins) = plugins {
+                        if let Some(ref prewarmer) = plugins.prewarmer {
+                            let mut prewarmer = prewarmer::Prewarmer {
+                                enabled: prewarmer.enabled,
+                                server: &mut conn,
+                                queries: &prewarmer.queries,
+                            };
+
+                            prewarmer.run().await?;
+                        }
                     }
-                }
 
-                stats.idle();
-                Ok(conn)
-            }
-            Err(err) => {
-                stats.disconnect();
-                Err(err)
+                    stats.idle();
+                    Ok(conn)
+                }
+                Err(err) => {
+                    stats.disconnect();
+                    Err(err)
+                }
             }
         }
     }
 
-    /// Determines if the connection is still connected to the database.
-    async fn is_valid(&self, _conn: &mut Self::Connection) -> Result<(), Self::Error> {
-        Ok(())
+    fn is_valid(
+        &self,
+        _conn: &mut Self::Connection,
+    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
+        async { Ok(()) }
     }
 
-    /// Synchronously determine if the connection is no longer usable, if possible.
     fn has_broken(&self, conn: &mut Self::Connection) -> bool {
         conn.is_bad()
     }
