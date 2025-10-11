@@ -39,6 +39,7 @@ func setup(t *testing.T) func() {
 	cmd := exec.Command(commandPath, cfg.Name())
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
+	cmd.Env = append(os.Environ(), "NO_COLOR=false")
 	go func() {
 		err = cmd.Run()
 		if err != nil {

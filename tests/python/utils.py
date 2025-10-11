@@ -28,32 +28,32 @@ def pgcat_generic_start(config: str):
     _pgcat_start(config_path=tmp.name)
 
 
-def glauth_send_signal(signal: signal.Signals):
+def glauth_send_signal(sig: signal.Signals):
     try:
         for proc in psutil.process_iter(["pid", "name"]):
             if proc.name() == "glauth":
-                os.kill(proc.pid, signal)
+                os.kill(proc.pid, sig)
     except Exception as e:
         # The process can be gone when we send this signal
         print(e)
 
-    if signal == signal.SIGTERM:
+    if sig == signal.SIGTERM:
         # Returns 0 if pgcat process exists
         time.sleep(2)
         if not os.system('pgrep glauth'):
             raise Exception("glauth not closed after SIGTERM")
 
 
-def pg_cat_send_signal(signal: signal.Signals):
+def pg_cat_send_signal(sig: signal.Signals):
     try:
         for proc in psutil.process_iter(["pid", "name"]):
             if "pgcat" == proc.name():
-                os.kill(proc.pid, signal)
+                os.kill(proc.pid, sig)
     except Exception as e:
         # The process can be gone when we send this signal
         print(e)
 
-    if signal == signal.SIGTERM:
+    if sig == signal.SIGTERM:
         # Returns 0 if pgcat process exists
         time.sleep(2)
         if not os.system('pgrep pgcat'):

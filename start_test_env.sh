@@ -8,7 +8,7 @@ cd tests/docker/
 docker compose kill main || true
 docker compose build main
 docker compose down
-docker compose up -d
+INTERACTIVE_TEST_ENVIRONMENT=true docker compose up -d
 # wait for the container to start
 while ! docker compose exec main ls; do
     echo "Waiting for test environment to start"

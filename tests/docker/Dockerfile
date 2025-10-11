@@ -2,7 +2,7 @@ FROM rust:1.82.0-slim-bookworm
 
 COPY --from=sclevine/yj /bin/yj /bin/yj
 RUN /bin/yj -h
-RUN apt-get update && apt-get install llvm-11 psmisc postgresql-contrib postgresql-client ruby ruby-dev libpq-dev python3 python3-pip lcov curl sudo iproute2 -y
+RUN apt-get update && apt-get install llvm psmisc procps postgresql-contrib postgresql-client ruby ruby-dev libpq-dev python3 python3-pip lcov curl sudo iproute2 wget -y
 RUN cargo install cargo-binutils rustfilt
 RUN rustup component add llvm-tools-preview
 RUN sudo gem install bundler

@@ -52,7 +52,7 @@ psql -U sharding_user -h 127.0.0.1 -p 6432 -c 'COPY (SELECT * FROM pgbench_accou
 # Query cancellation test
 (psql -U sharding_user -h 127.0.0.1 -p 6432 -c 'SELECT pg_sleep(50)' || true) &
 sleep 1
-killall psql -s SIGINT
+killall psql -s SIGINT || true
 
 # Pause/resume test.
 # Running benches before, during, and after pause/resume.
@@ -70,7 +70,7 @@ PGPASSWORD=admin_pass psql -U admin_user -h 127.0.0.1 -p 6432 -d pgbouncer -c 'R
 
 (psql -U sharding_user -h 127.0.0.1 -p 6432 -c 'SELECT pg_sleep(50)' || true) &
 sleep 1
-killall psql -s SIGINT
+killall psql -s SIGINT || true
 
 # Sharding insert
 psql -U sharding_user -e -h 127.0.0.1 -p 6432 -f tests/sharding/query_routing_test_insert.sql
@@ -83,7 +83,10 @@ psql -U sharding_user -e -h 127.0.0.1 -p 6432 -f tests/sharding/query_routing_te
 
 # Statement timeout tests
 sed -i 's/statement_timeout = 0/statement_timeout = 100/' .circleci/pgcat.toml
-kill -SIGHUP $(pgrep pgcat) # Reload config
+PGCAT_PID=$(pgrep pgcat || true)
+if [ -n "$PGCAT_PID" ]; then
+    kill -SIGHUP $PGCAT_PID
+fi
 sleep 0.2
 
 # This should timeout
@@ -91,7 +94,10 @@ sleep 0.2
 
 # Disable statement timeout
 sed -i 's/statement_timeout = 100/statement_timeout = 0/' .circleci/pgcat.toml
-kill -SIGHUP $(pgrep pgcat) # Reload config again
+PGCAT_PID=$(pgrep pgcat || true)
+if [ -n "$PGCAT_PID" ]; then
+    kill -SIGHUP $PGCAT_PID
+fi
 
 #
 # Integration tests and ActiveRecord tests
@@ -106,7 +112,7 @@ cd ../..
 # Python tests
 # These tests will start and stop the pgcat server so it will need to be restarted after the tests
 #
-pip3 install -r tests/python/requirements.txt
+pip3 install -r tests/python/requirements.txt --break-system-packages || exit 1
 pytest || exit 1
 
 
@@ -115,7 +121,7 @@ pytest || exit 1
 # Starts its own pgcat server
 #
 pushd tests/go
-/usr/local/go/bin/go test || exit 1
+/usr/local/go/bin/go test -v || exit 1
 popd
 
 start_pgcat "info"
@@ -163,7 +169,10 @@ start_pgcat "info"
 sed -i '0,/simple_db/s/pool_mode = "transaction"/pool_mode = "session"/' .circleci/pgcat.toml
 
 # Reload config test
-kill -SIGHUP $(pgrep pgcat)
+PGCAT_PID=$(pgrep pgcat || true)
+if [ -n "$PGCAT_PID" ]; then
+    kill -SIGHUP $PGCAT_PID
+fi
 
 # Revert settings after reload. Makes test runs idempotent
 sed -i '0,/simple_db/s/pool_mode = "session"/pool_mode = "transaction"/' .circleci/pgcat.toml
@@ -174,10 +183,13 @@ sleep 1
 pgbench -U sharding_user -h 127.0.0.1 -p 6432 -t 500 -c 2 --protocol prepared
 
 # Attempt clean shut down
-killall pgcat -s SIGINT
+killall pgcat -s SIGINT || true
 
 # Allow for graceful shutdown
 sleep 1
 
-kill -9 $(pgrep toxiproxy)
+TOXIPROXY_PID=$(pgrep toxiproxy || true)
+if [ -n "$TOXIPROXY_PID" ]; then
+    kill -9 $TOXIPROXY_PID
+fi
 sleep 1
