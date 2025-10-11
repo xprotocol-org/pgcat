@@ -312,6 +312,9 @@ pub struct General {
     #[serde(default = "General::default_healthcheck_delay")]
     pub healthcheck_delay: u64,
 
+    #[serde(default = "General::default_server_recv_timeout")]
+    pub server_recv_timeout: u64,
+
     #[serde(default = "General::default_ban_time")]
     pub ban_time: i64,
 
@@ -391,7 +394,7 @@ impl General {
     }
 
     pub fn default_tcp_user_timeout() -> u64 {
-        10000 // 10000 milliseconds
+        30000 // 30s: allows keepalives (5s idle + 5s*5 probes = 30s total) to complete
     }
 
     pub fn default_idle_timeout() -> u64 {
@@ -407,11 +410,15 @@ impl General {
     }
 
     pub fn default_healthcheck_timeout() -> u64 {
-        1000
+        3000 // 3s: more lenient to avoid false positives under load
     }
 
     pub fn default_healthcheck_delay() -> u64 {
-        30000
+        10000 // 10s: check more frequently to detect failures faster
+    }
+
+    pub fn default_server_recv_timeout() -> u64 {
+        60000 // 60s: max time to wait for server response (prevents indefinite hangs)
     }
 
     pub fn default_ban_time() -> i64 {
@@ -459,6 +466,7 @@ impl Default for General {
             shutdown_timeout: Self::default_shutdown_timeout(),
             healthcheck_timeout: Self::default_healthcheck_timeout(),
             healthcheck_delay: Self::default_healthcheck_delay(),
+            server_recv_timeout: Self::default_server_recv_timeout(),
             ban_time: Self::default_ban_time(),
             idle_client_in_transaction_timeout: Self::default_idle_client_in_transaction_timeout(),
             server_lifetime: Self::default_server_lifetime(),
@@ -1241,6 +1249,7 @@ impl Config {
         );
         info!("Shutdown timeout: {}ms", self.general.shutdown_timeout);
         info!("Healthcheck delay: {}ms", self.general.healthcheck_delay);
+        info!("Server recv timeout: {}ms", self.general.server_recv_timeout);
         info!(
             "Default max server lifetime: {}ms",
             self.general.server_lifetime

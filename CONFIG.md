@@ -101,7 +101,7 @@ How long a client is allowed to be idle while in a transaction (ms).
 ### healthcheck_timeout
 ```
 path: general.healthcheck_timeout
-default: 1000 # milliseconds
+default: 3000 # milliseconds (increased from 1000 to reduce false positives under load)
 ```
 
 How much time to give the health check query to return with a result (ms).
@@ -109,10 +109,18 @@ How much time to give the health check query to return with a result (ms).
 ### healthcheck_delay
 ```
 path: general.healthcheck_delay
-default: 30000 # milliseconds
+default: 10000 # milliseconds (reduced from 30000 to detect failures faster)
 ```
 
 How long to keep connection available for immediate re-use, without running a healthcheck query on it
+
+### server_recv_timeout
+```
+path: general.server_recv_timeout
+default: 60000 # milliseconds
+```
+
+Maximum time to wait for a server response before timing out (ms). Prevents indefinite hangs when waiting for server data. This timeout applies to internal operations like prepared statement registration and query execution. Client-facing statement_timeout still applies separately for user queries.
 
 ### shutdown_timeout
 ```
@@ -187,9 +195,9 @@ default: 5
 ### tcp_user_timeout
 ```
 path: general.tcp_user_timeout
-default: 10000
+default: 30000 # milliseconds (increased from 10000 to allow keepalives to complete)
 ```
-A linux-only parameters that defines the amount of time in milliseconds that transmitted data may remain unacknowledged or buffered data may remain untransmitted (due to zero window size) before TCP will forcibly disconnect
+A linux-only parameter that defines the amount of time in milliseconds that transmitted data may remain unacknowledged or buffered data may remain untransmitted (due to zero window size) before TCP will forcibly disconnect. Should be set to at least `tcp_keepalives_idle + (tcp_keepalives_interval * tcp_keepalives_count)` to allow keepalive probes to complete.
 
 
 ### tls_certificate
@@ -307,7 +315,7 @@ default: 0 (disabled)
 `Maximum number of checkout failures a client is allowed before it
 gets disconnected. This is needed to prevent persistent client/server
 imbalance in high availability setups where multiple PgCat instances are placed
-behind a single load balancer. If for any reason a client lands on a PgCat instance that has 
+behind a single load balancer. If for any reason a client lands on a PgCat instance that has
 a large number of connected clients, it might get stuck in perpetual checkout failure loop especially
 in session mode
 `

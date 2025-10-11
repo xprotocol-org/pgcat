@@ -30,10 +30,14 @@ server_lifetime = 86400000 # 24 hours
 idle_client_in_transaction_timeout = 0 # milliseconds
 
 # How much time to give the health check query to return with a result (ms).
-healthcheck_timeout = 1000 # milliseconds
+healthcheck_timeout = 3000 # milliseconds (increased from 1000 to reduce false positives under load)
 
 # How long to keep connection available for immediate re-use, without running a healthcheck query on it
-healthcheck_delay = 30000 # milliseconds
+healthcheck_delay = 10000 # milliseconds (reduced from 30000 to detect failures faster)
+
+# Maximum time to wait for a server response before timing out (ms).
+# Prevents indefinite hangs when waiting for server data.
+server_recv_timeout = 60000 # milliseconds
 
 # How much time to give clients during shutdown before forcibly killing client connections (ms).
 shutdown_timeout = 60000 # milliseconds
@@ -59,6 +63,9 @@ tcp_keepalives_idle = 5
 tcp_keepalives_count = 5
 # Number of seconds between keepalive packets.
 tcp_keepalives_interval = 5
+# Linux-only: milliseconds that data may remain unacknowledged before forcibly closing connection.
+# Should be >= tcp_keepalives_idle + (tcp_keepalives_interval * tcp_keepalives_count) to allow probes to complete.
+tcp_user_timeout = 30000 # milliseconds (allows keepalives: 5s idle + 5s*5 probes = 30s total)
 
 # Path to TLS Certificate file to use for TLS connections
 # tls_certificate = ".circleci/server.cert"

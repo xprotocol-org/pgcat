@@ -899,6 +899,31 @@ impl Server {
         }
     }
 
+    /// Receive data from the server with a timeout to prevent indefinite hangs.
+    /// Uses the configured server_recv_timeout value.
+    pub async fn recv_timeout(
+        &mut self,
+        client_server_parameters: Option<&mut ServerParameters>,
+    ) -> Result<BytesMut, Error> {
+        let config = get_config();
+        let timeout_duration = std::time::Duration::from_millis(config.general.server_recv_timeout);
+
+        match tokio::time::timeout(timeout_duration, self.recv(client_server_parameters)).await {
+            Ok(result) => result,
+            Err(_) => {
+                error!(
+                    "Server recv timeout ({:?}) on {:?}",
+                    timeout_duration, self.address
+                );
+                self.bad = true;
+                Err(Error::SocketError(format!(
+                    "Server recv timeout after {:?}",
+                    timeout_duration
+                )))
+            }
+        }
+    }
+
     /// Receive data from the server in response to a client request.
     /// This method must be called multiple times while `self.is_data_available()` is true
     /// in order to receive all data the server has to offer.
@@ -1195,7 +1220,7 @@ impl Server {
                 self.send(&bytes).await?;
 
                 loop {
-                    self.recv(None).await?;
+                    self.recv_timeout(None).await?;
 
                     if !self.is_data_available() {
                         break;
@@ -1309,7 +1334,7 @@ impl Server {
         self.send(&query).await?;
 
         loop {
-            let _ = self.recv(None).await?;
+            let _ = self.recv_timeout(None).await?;
 
             if !self.data_available {
                 break;
@@ -1420,7 +1445,7 @@ impl Server {
         .await?;
         debug!("Connected!, sending query.");
         server.send(&simple_query(query)).await?;
-        let mut message = server.recv(None).await?;
+        let mut message = server.recv_timeout(None).await?;
 
         parse_query_message(&mut message).await
     }
