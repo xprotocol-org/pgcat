@@ -364,7 +364,7 @@ where
     res.put_i32(error.len() as i32 + 4);
     res.put(error);
 
-    write_all_half(stream, &res).await
+    write_all_flush(stream, &res).await
 }
 
 pub async fn wrong_password<S>(stream: &mut S, user: &str) -> Result<(), Error>
@@ -1431,8 +1431,10 @@ impl PgErrorMsg {
 
 #[cfg(test)]
 mod tests {
-    use crate::messages::PgErrorMsg;
+    use crate::errors::Error;
+    use crate::messages::{error_response_terminal, read_message, write_all_flush, PgErrorMsg};
     use log::{error, info};
+    use tokio::io::AsyncWriteExt;
 
     fn field(kind: char, content: &str) -> Vec<u8> {
         format!("{kind}{content}\0").as_bytes().to_vec()
@@ -1544,5 +1546,129 @@ mod tests {
             },
             PgErrorMsg::parse(&only_mandatory_msg).unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn test_read_message_unexpected_eof() {
+        let (mut client, server) = tokio::io::duplex(64);
+
+        drop(server);
+
+        let result = read_message(&mut client).await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            Error::SocketError(msg) => {
+                assert!(msg.contains("Error reading message code from socket"));
+            }
+            other => panic!("Expected SocketError, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_read_message_partial_then_disconnect() {
+        let (mut client, mut server) = tokio::io::duplex(64);
+
+        tokio::spawn(async move {
+            server.write_u8(b'Q').await.unwrap();
+            drop(server);
+        });
+
+        let result = read_message(&mut client).await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            Error::SocketError(msg) => {
+                assert!(msg.contains("Error reading message len from socket"));
+            }
+            other => panic!("Expected SocketError for partial read, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_write_all_flush_broken_pipe() {
+        let (mut client, server) = tokio::io::duplex(64);
+
+        drop(server);
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+        let data = b"test data";
+        let result = write_all_flush(&mut client, data).await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            Error::SocketError(msg) => {
+                assert!(msg.contains("Error writing to socket"));
+            }
+            other => panic!("Expected SocketError for broken pipe, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_error_response_terminal_flushes() {
+        use tokio::io::AsyncReadExt;
+
+        let (mut client, mut server) = tokio::io::duplex(1024);
+
+        let handle = tokio::spawn(async move {
+            error_response_terminal(&mut server, "test error message").await
+        });
+
+        let mut buffer = vec![0u8; 1024];
+        let mut total_read = 0;
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+        loop {
+            match tokio::time::timeout(
+                tokio::time::Duration::from_millis(100),
+                client.read(&mut buffer[total_read..])
+            ).await {
+                Ok(Ok(n)) if n > 0 => {
+                    total_read += n;
+                    if total_read >= 5 {
+                        let msg_len = i32::from_be_bytes([buffer[1], buffer[2], buffer[3], buffer[4]]);
+                        if total_read >= (5 + msg_len as usize - 4) {
+                            break;
+                        }
+                    }
+                }
+                Ok(Ok(_)) => break,
+                Ok(Err(e)) => panic!("Read error: {}", e),
+                Err(_) => break,
+            }
+        }
+
+        assert!(total_read > 0, "No data received - message was not flushed");
+        assert_eq!(buffer[0], b'E', "Expected error message code 'E'");
+
+        let error_msg = String::from_utf8_lossy(&buffer[..total_read]);
+        assert!(error_msg.contains("test error message"), "Expected error message not found in response");
+
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_read_message_success() {
+        use bytes::{BufMut, BytesMut};
+
+        let (mut client, mut server) = tokio::io::duplex(64);
+
+        tokio::spawn(async move {
+            let mut msg = BytesMut::new();
+            msg.put_u8(b'Q');
+            msg.put_i32(10);
+            msg.put_slice(b"SELECT");
+
+            server.write_all(&msg).await.unwrap();
+            server.flush().await.unwrap();
+        });
+
+        let result = read_message(&mut client).await;
+
+        assert!(result.is_ok());
+        let msg = result.unwrap();
+        assert_eq!(msg[0], b'Q');
     }
 }

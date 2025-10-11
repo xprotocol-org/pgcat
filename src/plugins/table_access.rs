@@ -32,7 +32,7 @@ impl<'a> Plugin for TableAccess<'a> {
 
         let mut found = None;
 
-        visit_relations(ast, |relation| {
+        let _ = visit_relations(ast, |relation| {
             let relation = relation.to_string();
             let parts = relation.split('.').collect::<Vec<&str>>();
             let table_name = parts.last().unwrap();
