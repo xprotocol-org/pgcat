@@ -1,4 +1,4 @@
-FROM rust:1.82.0-slim-bookworm
+FROM rust:1.90.0-slim-bookworm
 
 COPY --from=sclevine/yj /bin/yj /bin/yj
 RUN /bin/yj -h

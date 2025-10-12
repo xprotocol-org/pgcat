@@ -40,7 +40,7 @@ fi
 export LLVM_PROFILE_FILE="/app/pgcat-%m-%p.profraw"
 export RUSTC_BOOTSTRAP=1
 export CARGO_INCREMENTAL=0
-export RUSTFLAGS="-Zprofile -Ccodegen-units=1 -Copt-level=0 -Clink-dead-code -Coverflow-checks=off -Zpanic_abort_tests -Cpanic=abort -Cinstrument-coverage"
+export RUSTFLAGS="-Ccodegen-units=1 -Copt-level=0 -Clink-dead-code -Coverflow-checks=off -Zpanic_abort_tests -Cpanic=abort -Cinstrument-coverage"
 export RUSTDOCFLAGS="-Cpanic=abort"
 
 cd /app/
