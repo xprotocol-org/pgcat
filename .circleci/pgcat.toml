@@ -156,3 +156,46 @@ servers = [
     [ "localhost", 5432, "replica" ]
 ]
 database = "some_db"
+
+# Default pool for dynamic pool creation
+[pools.default]
+pool_mode = "transaction"
+default_role = "any"
+query_parser_enabled = true
+query_parser_read_write_splitting = true
+primary_reads_enabled = true
+sharding_function = "pg_bigint_hash"
+
+[pools.default.users.0]
+username = "sharding_user"
+password = "sharding_user"
+pool_size = 15
+
+[pools.default.users.1]
+username = "simple_user"
+password = "simple_user"
+pool_size = 15
+
+[pools.default.shards.0]
+servers = [
+    [ "127.0.0.1", 5432, "primary" ],
+    [ "localhost", 5432, "replica" ]
+]
+database = "postgres"
+
+# Static pool for non-existent database (for testing)
+[pools.nonexistent_static_db]
+pool_mode = "session"
+default_role = "primary"
+query_parser_enabled = true
+
+[pools.nonexistent_static_db.users.0]
+username = "simple_user"
+password = "simple_user"
+pool_size = 5
+
+[pools.nonexistent_static_db.shards.0]
+servers = [
+    [ "127.0.0.1", 5432, "primary" ]
+]
+database = "nonexistent_static_db"

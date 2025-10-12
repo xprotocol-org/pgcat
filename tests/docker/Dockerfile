@@ -11,3 +11,14 @@ RUN wget -O toxiproxy-2.4.0.deb https://github.com/Shopify/toxiproxy/releases/do
 RUN wget -O go1.21.3.linux-$(dpkg --print-architecture).tar.gz https://go.dev/dl/go1.21.3.linux-$(dpkg --print-architecture).tar.gz && \
     sudo tar -C /usr/local -xzf go1.21.3.linux-$(dpkg --print-architecture).tar.gz && \
     rm go1.21.3.linux-$(dpkg --print-architecture).tar.gz
+
+RUN mkdir -p /app/target && chmod 777 /app/target
+
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+HEALTHCHECK --interval=1s --timeout=1s --start-period=5s --retries=30 \
+    CMD test -f /tmp/.container_ready || exit 1
+
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["sleep", "infinity"]

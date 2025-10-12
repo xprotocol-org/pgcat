@@ -42,6 +42,7 @@ pub type ClientServerMap =
 pub type PoolMap = HashMap<PoolIdentifier, ConnectionPool>;
 
 pub static POOLS: Lazy<ArcSwap<PoolMap>> = Lazy::new(|| ArcSwap::from_pointee(HashMap::default()));
+static POOLS_WRITE_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
 struct ConnectionTimeouts {
     connect: u64,
@@ -836,6 +837,75 @@ impl ConnectionPool {
         }
     }
 
+    pub async fn create_dynamic_pool(
+        db_name: &str,
+        username: &str,
+        _password_hash: &[u8],
+        client_server_map: ClientServerMap,
+    ) -> Result<ConnectionPool, Error> {
+        let config = get_config();
+
+        let default_pool_config = match config.pools.get("default") {
+            Some(pool_config) => pool_config,
+            None => return Err(Error::ClientError("No default pool configured".into())),
+        };
+
+        let default_user = match default_pool_config
+            .users
+            .values()
+            .find(|user| user.username == username)
+        {
+            Some(user) => user,
+            None => {
+                return Err(Error::ClientError(format!(
+                    "User '{}' not found in default pool configuration",
+                    username
+                )))
+            }
+        };
+
+        let dynamic_user = default_user.clone();
+
+        let mut dynamic_pool_config = default_pool_config.clone();
+
+        for shard in dynamic_pool_config.shards.values_mut() {
+            shard.database = db_name.to_string();
+        }
+
+        dynamic_pool_config.idle_timeout = Some(5000);
+        dynamic_pool_config.server_lifetime = Some(30000);
+
+        let mut address_id: usize = 0;
+
+        info!(
+            "[pool: {}][user: {}] creating dynamic pool",
+            db_name, username
+        );
+
+        let pool = Self::build_pool(
+            db_name,
+            &dynamic_user,
+            &dynamic_pool_config,
+            &config,
+            &client_server_map,
+            &mut address_id,
+        )
+        .await?;
+
+        Self::spawn_validation_if_needed(&pool, &config);
+
+        Ok(pool)
+    }
+
+    pub fn get_default_pool_user() -> Option<User> {
+        let config = get_config();
+
+        let default_pool_config = config.pools.get("default")?;
+        let default_user = default_pool_config.users.values().next()?;
+
+        Some(default_user.clone())
+    }
+
     /// Connect to all shards, grab server information, and possibly
     /// passwords to use in client auth.
     /// Return server information we will pass to the clients
@@ -929,6 +999,10 @@ impl ConnectionPool {
         role: Option<Role>,         // primary or replica
         client_stats: &ClientStats, // client id
     ) -> Result<(PooledConnection<'_, ServerPool>, Address), Error> {
+        if !self.validated() {
+            self.validate().await?;
+        }
+
         let effective_shard_id = if self.shards() == 1 {
             // The base, unsharded case
             Some(0)
@@ -1472,6 +1546,46 @@ pub fn get_pool(db: &str, user: &str) -> Option<ConnectionPool> {
     (*(*POOLS.load()))
         .get(&PoolIdentifier::new(db, user))
         .cloned()
+}
+
+/// Get or create a pool dynamically if it doesn't exist and default pool is configured
+pub async fn get_or_create_pool(
+    db: &str,
+    user: &str,
+    client_server_map: ClientServerMap,
+) -> Result<Option<ConnectionPool>, Error> {
+    if let Some(pool) = get_pool(db, user) {
+        return Ok(Some(pool));
+    }
+
+    if !has_default_pool() {
+        return Ok(None);
+    }
+
+    info!(
+        "Creating dynamic pool for database: {:?}, user: {:?}",
+        db, user
+    );
+
+    let pool = ConnectionPool::create_dynamic_pool(db, user, &[], client_server_map).await?;
+
+    add_dynamic_pool(db, user, pool.clone());
+
+    Ok(Some(pool))
+}
+
+/// Check if default pool exists (used to determine if dynamic pool creation is available)
+fn has_default_pool() -> bool {
+    let config = get_config();
+    config.pools.get("default").is_some()
+}
+
+/// Add a dynamic pool to the pool map
+fn add_dynamic_pool(db: &str, user: &str, pool: ConnectionPool) {
+    let _guard = POOLS_WRITE_LOCK.lock();
+    let mut pools = (*(*POOLS.load())).clone();
+    pools.insert(PoolIdentifier::new(db, user), pool);
+    POOLS.store(Arc::new(pools));
 }
 
 /// Get a pointer to all configured pools.

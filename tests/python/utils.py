@@ -61,21 +61,25 @@ def pg_cat_send_signal(sig: signal.Signals):
 
 
 def connect_db(
+    database: str = None,
+    user: str = None,
+    password: str = None,
     autocommit: bool = True,
     admin: bool = False,
 ) -> Tuple[psycopg2.extensions.connection, psycopg2.extensions.cursor]:
 
-    if admin:
-        user = "admin_user"
-        password = "admin_pass"
-        db = "pgcat"
-    else:
-        user = "sharding_user"
-        password = "sharding_user"
-        db = "sharded_db"
+    if database is None or user is None or password is None:
+        if admin:
+            user = user or "admin_user"
+            password = password or "admin_pass"
+            database = database or "pgcat"
+        else:
+            user = user or "sharding_user"
+            password = password or "sharding_user"
+            database = database or "sharded_db"
 
     conn = psycopg2.connect(
-        f"postgres://{user}:{password}@{PGCAT_HOST}:{PGCAT_PORT}/{db}?application_name=testing_pgcat",
+        f"postgres://{user}:{password}@{PGCAT_HOST}:{PGCAT_PORT}/{database}?application_name=testing_pgcat",
         connect_timeout=2,
     )
     conn.autocommit = autocommit
@@ -84,19 +88,22 @@ def connect_db(
     return (conn, cur)
 
 def connect_db_trust(
+    database: str = None,
+    user: str = None,
     autocommit: bool = True,
     admin: bool = False,
 ) -> Tuple[psycopg2.extensions.connection, psycopg2.extensions.cursor]:
 
-    if admin:
-        user = "admin_user"
-        db = "pgcat"
-    else:
-        user = "sharding_user"
-        db = "sharded_db"
+    if database is None or user is None:
+        if admin:
+            user = user or "admin_user"
+            database = database or "pgcat"
+        else:
+            user = user or "sharding_user"
+            database = database or "sharded_db"
 
     conn = psycopg2.connect(
-        f"postgres://{user}@{PGCAT_HOST}:{PGCAT_PORT}/{db}?application_name=testing_pgcat",
+        f"postgres://{user}@{PGCAT_HOST}:{PGCAT_PORT}/{database}?application_name=testing_pgcat",
         connect_timeout=2,
     )
     conn.autocommit = autocommit

@@ -20,7 +20,7 @@ use crate::config::{
 use crate::constants::*;
 use crate::messages::*;
 use crate::plugins::PluginOutput;
-use crate::pool::{get_pool, ClientServerMap, ConnectionPool};
+use crate::pool::{get_or_create_pool, ClientServerMap, ConnectionPool};
 use crate::query_router::{Command, QueryRouter};
 use crate::server::{Server, ServerParameters};
 use crate::stats::{ClientStats, ServerStats};
@@ -557,9 +557,9 @@ where
         }
         // Authenticate normal user.
         else {
-            let pool = match get_pool(pool_name, username) {
-                Some(pool) => pool,
-                None => {
+            let pool = match get_or_create_pool(pool_name, username, client_server_map.clone()).await {
+                Ok(Some(pool)) => pool,
+                Ok(None) => {
                     error_response(
                         &mut write,
                         &format!(
@@ -571,6 +571,14 @@ where
 
                     return Err(Error::ClientGeneralError(
                         "Invalid pool name".into(),
+                        client_identifier,
+                    ));
+                }
+                Err(err) => {
+                    error_response(&mut write, &err.to_string()).await?;
+
+                    return Err(Error::ClientGeneralError(
+                        err.to_string(),
                         client_identifier,
                     ));
                 }
@@ -1068,81 +1076,117 @@ where
                 self.stats.waiting();
             }
 
-            // Grab a server from the pool.
-            let connection = match pool
-                .get(query_router.shard(), query_router.role(), &self.stats)
-                .await
-            {
-                Ok(conn) => {
-                    debug!("Got connection from pool");
-                    conn
-                }
-                Err(err) => {
-                    // Client is attempting to get results from the server,
-                    // but we were unable to grab a connection from the pool
-                    // We'll send back an error message and clean the extended
-                    // protocol buffer
-                    self.stats.idle();
-
-                    if message[0] as char == 'S' {
-                        error!("Got Sync message but failed to get a connection from the pool");
-                        self.reset_buffered_state();
+            let (mut reference, address) = loop {
+                let connection = match pool
+                    .get(query_router.shard(), query_router.role(), &self.stats)
+                    .await
+                {
+                    Ok(conn) => {
+                        debug!("Got connection from pool");
+                        conn
                     }
+                    Err(err) => {
+                        self.stats.idle();
 
-                    error_response(
-                        &mut self.write,
-                        format!("could not get connection from the pool - {}", err).as_str(),
-                    )
-                    .await?;
-
-                    error!(
-                        "Could not get connection from pool: \
-                        {{ \
-                            pool_name: {:?}, \
-                            username: {:?}, \
-                            shard: {:?}, \
-                            role: \"{:?}\", \
-                            error: \"{:?}\" \
-                        }}",
-                        self.pool_name,
-                        self.username,
-                        query_router.shard(),
-                        query_router.role(),
-                        err
-                    );
-                    checkout_failure_count += 1;
-                    if let Some(limit) = pool.settings.checkout_failure_limit {
-                        if checkout_failure_count >= limit {
-                            error!(
-                                "Checkout failure limit reached ({} / {}) - disconnecting client",
-                                checkout_failure_count, limit
-                            );
-                            error_response_terminal(
-                                &mut self.write,
-                                &format!(
-                                    "checkout failure limit reached ({} / {})",
-                                    checkout_failure_count, limit
-                                ),
-                            )
-                            .await?;
-                            self.stats.disconnect();
-                            return Ok(());
+                        if message[0] as char == 'S' {
+                            error!("Got Sync message but failed to get a connection from the pool");
+                            self.reset_buffered_state();
                         }
+
+                        error_response(
+                            &mut self.write,
+                            format!("could not get connection from the pool - {}", err).as_str(),
+                        )
+                        .await?;
+
+                        error!(
+                            "Could not get connection from pool: \
+                            {{ \
+                                pool_name: {:?}, \
+                                username: {:?}, \
+                                shard: {:?}, \
+                                role: \"{:?}\", \
+                                error: \"{:?}\" \
+                            }}",
+                            self.pool_name,
+                            self.username,
+                            query_router.shard(),
+                            query_router.role(),
+                            err
+                        );
+                        checkout_failure_count += 1;
+                        if let Some(limit) = pool.settings.checkout_failure_limit {
+                            if checkout_failure_count >= limit {
+                                error!(
+                                    "Checkout failure limit reached ({} / {}) - disconnecting client",
+                                    checkout_failure_count, limit
+                                );
+                                error_response_terminal(
+                                    &mut self.write,
+                                    &format!(
+                                        "checkout failure limit reached ({} / {})",
+                                        checkout_failure_count, limit
+                                    ),
+                                )
+                                .await?;
+                                self.stats.disconnect();
+                                return Ok(());
+                            }
+                        }
+                        continue;
                     }
-                    continue;
+                };
+
+                let mut reference = connection.0;
+                let address = connection.1;
+                let server = &mut *reference;
+
+                if !self.transaction_mode {
+                    if let Err(err) = server.query(";").await {
+                        warn!(
+                            "Session mode: connection validation failed on checkout from pool, retrying with another connection: {:?}",
+                            err
+                        );
+                        server.mark_bad("session mode checkout validation failed");
+
+                        pool.ban(&address, BanReason::FailedHealthCheck, Some(&self.stats));
+
+                        drop(reference);
+
+                        checkout_failure_count += 1;
+                        if let Some(limit) = pool.settings.checkout_failure_limit {
+                            if checkout_failure_count >= limit {
+                                error!(
+                                    "Connection validation failure limit reached ({} / {}) - disconnecting client",
+                                    checkout_failure_count, limit
+                                );
+                                self.stats.idle();
+                                error_response_terminal(
+                                    &mut self.write,
+                                    &format!(
+                                        "connection validation failure limit reached ({} / {})",
+                                        checkout_failure_count, limit
+                                    ),
+                                )
+                                .await?;
+                                self.stats.disconnect();
+                                return Ok(());
+                            }
+                        }
+
+                        continue;
+                    }
+                    debug!("Session mode: connection validated on checkout");
                 }
+
+                break (reference, address);
             };
 
-            let mut reference = connection.0;
-            let address = connection.1;
             let server = &mut *reference;
 
-            // Server is assigned to the client in case the client wants to
-            // cancel a query later.
             server.claim(self.process_id, self.secret_key);
             self.connected_to_server = true;
 
-            // Update statistics
             self.stats.active();
 
             self.last_address_id = Some(address.id);
@@ -1185,10 +1229,12 @@ where
                         {
                             Ok(Ok(message)) => message,
                             Ok(Err(err)) => {
-                                // Client disconnected inside a transaction.
-                                // Clean up the server and re-use it.
                                 self.stats.disconnect();
-                                server.checkin_cleanup().await?;
+
+                                if let Err(cleanup_err) = server.checkin_cleanup().await {
+                                    warn!("Failed to cleanup server connection after client disconnect, connection will be discarded: {:?}", cleanup_err);
+                                    server.mark_bad("checkin_cleanup failed after client disconnect");
+                                }
 
                                 return Err(err);
                             }
@@ -1298,7 +1344,11 @@ where
 
                     // Terminate
                     'X' => {
-                        server.checkin_cleanup().await?;
+                        if let Err(err) = server.checkin_cleanup().await {
+                            warn!("Failed to cleanup server connection on client terminate, connection will be discarded: {:?}", err);
+                            server.mark_bad("checkin_cleanup failed on client terminate");
+                        }
+
                         self.stats.disconnect();
                         self.release();
 
@@ -1609,10 +1659,12 @@ where
                 }
             }
 
-            // The server is no longer bound to us, we can't cancel it's queries anymore.
             debug!("Releasing server back into the pool");
 
-            server.checkin_cleanup().await?;
+            if let Err(err) = server.checkin_cleanup().await {
+                warn!("Failed to cleanup server connection, connection will be discarded: {:?}", err);
+                server.mark_bad("checkin_cleanup failed");
+            }
 
             server.stats().idle();
             self.connected_to_server = false;
@@ -1622,12 +1674,12 @@ where
         }
     }
 
-    /// Retrieve connection pool, if it exists.
+    /// Retrieve connection pool, if it exists or can be created dynamically.
     /// Return an error to the client otherwise.
     async fn get_pool(&mut self) -> Result<ConnectionPool, Error> {
-        match get_pool(&self.pool_name, &self.username) {
-            Some(pool) => Ok(pool),
-            None => {
+        match get_or_create_pool(&self.pool_name, &self.username, self.client_server_map.clone()).await {
+            Ok(Some(pool)) => Ok(pool),
+            Ok(None) => {
                 error_response(
                     &mut self.write,
                     &format!(
@@ -1643,6 +1695,10 @@ where
                     self.username,
                     self.server_parameters.get_application_name()
                 )))
+            }
+            Err(err) => {
+                error_response(&mut self.write, &err.to_string()).await?;
+                Err(err)
             }
         }
     }

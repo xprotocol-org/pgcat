@@ -8,6 +8,7 @@ class ConfigReloadFailed < StandardError; end
 class PgcatProcess
   attr_reader :port
   attr_reader :pid
+  attr_reader :host
 
   def self.finalize(pid, log_filename, config_filename)
     if pid
@@ -21,6 +22,7 @@ class PgcatProcess
 
   def initialize(log_level)
     @env = {}
+    @host = "0.0.0.0"
     @port = rand(20000..32760)
     @log_level = log_level
     @log_filename = "/tmp/pgcat_log_#{SecureRandom.urlsafe_base64}.log"
@@ -123,13 +125,13 @@ class PgcatProcess
     username = cfg["general"]["admin_username"]
     password = cfg["general"]["admin_password"]
 
-    "postgresql://#{username}:#{password}@0.0.0.0:#{@port}/pgcat"
+    "postgresql://#{username}:#{password}@#{@host}:#{@port}/pgcat"
   end
 
   def connection_string(pool_name, username, password = nil, parameters: {})
     cfg = current_config
     user_idx, user_obj = cfg["pools"][pool_name]["users"].detect { |k, user| user["username"] == username }
-    connection_string = "postgresql://#{username}:#{password || user_obj["password"]}@0.0.0.0:#{@port}/#{pool_name}"
+    connection_string = "postgresql://#{username}:#{password || user_obj["password"]}@#{@host}:#{@port}/#{pool_name}"
 
     # Add the additional parameters to the connection string
     parameter_string = parameters.map { |key, value| "#{key}=#{value}" }.join("&")
@@ -147,6 +149,6 @@ class PgcatProcess
     username = cfg["pools"][first_pool_name]["users"]["0"]["username"]
     password = cfg["pools"][first_pool_name]["users"]["0"]["password"]
 
-    "postgresql://#{username}:#{password}@0.0.0.0:#{@port}/#{db_name}?application_name=example_app"
+    "postgresql://#{username}:#{password}@#{@host}:#{@port}/#{db_name}?application_name=example_app"
   end
 end

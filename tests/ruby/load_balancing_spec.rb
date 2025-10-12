@@ -91,6 +91,77 @@ describe "Random Load Balancing" do
       expect(failed_count).to eq(0)
     end
   end
+
+  context "when clients disconnect proactively" do
+    let(:processes) { Helpers::Pgcat.single_shard_setup("sharded_db", 5, "transaction", "random", "debug", {"default_role" => "replica"}) }
+
+    it "does not ban servers when clients disconnect" do
+      admin_conn = PG::connect(processes.pgcat.admin_connection_string)
+
+      bans_before = admin_conn.async_exec("SHOW BANS").to_a
+      expect(bans_before.count).to eq(0)
+
+      5.times do
+        conn = PG.connect(processes.pgcat.connection_string("sharded_db", "sharding_user"))
+        conn.async_exec("SELECT 1 + 2")
+        conn.close
+      end
+
+      sleep(0.2)
+
+      bans_after = admin_conn.async_exec("SHOW BANS").to_a
+      expect(bans_after.count).to eq(0)
+
+      admin_conn.close
+    end
+
+    it "does not ban servers when clients disconnect during transaction" do
+      admin_conn = PG::connect(processes.pgcat.admin_connection_string)
+
+      bans_before = admin_conn.async_exec("SHOW BANS").to_a
+      expect(bans_before.count).to eq(0)
+
+      5.times do
+        conn = PG.connect(processes.pgcat.connection_string("sharded_db", "sharding_user"))
+        conn.async_exec("BEGIN")
+        conn.async_exec("SELECT 1 + 2")
+        conn.close
+      end
+
+      sleep(0.2)
+
+      bans_after = admin_conn.async_exec("SHOW BANS").to_a
+      expect(bans_after.count).to eq(0)
+
+      admin_conn.close
+    end
+
+    it "does not ban servers when clients disconnect abruptly" do
+      admin_conn = PG::connect(processes.pgcat.admin_connection_string)
+
+      bans_before = admin_conn.async_exec("SHOW BANS").to_a
+      expect(bans_before.count).to eq(0)
+
+      3.times do
+        random_string = (0...12).map { (65 + rand(26)).chr }.join
+        connection_string = processes.pgcat.connection_string("sharded_db", "sharding_user", parameters: {"application_name" => random_string})
+
+        pid = Process.spawn("psql -Atx #{connection_string} -c 'SELECT pg_sleep(2)' >/dev/null 2>&1")
+        sleep(0.3)
+
+        `pkill -9 -f '#{random_string}'`
+        Process.wait(pid) rescue nil
+      end
+
+      sleep(0.5)
+
+      bans_after = admin_conn.async_exec("SHOW BANS").to_a
+      expect(bans_after.count).to eq(0)
+
+      admin_conn.close
+    end
+  end
+
 end
 
 describe "Least Outstanding Queries Load Balancing" do

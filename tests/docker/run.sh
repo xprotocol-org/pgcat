@@ -1,12 +1,7 @@
 #!/bin/bash
 
-rm -rf /app/target/ || true
-rm /app/*.profraw || true
-rm /app/pgcat.profdata || true
-rm -rf /app/cov || true
-
 # Prepares the interactive test environment
-# 
+#
 if [ -n "$INTERACTIVE_TEST_ENVIRONMENT" ]; then
     ports=(5432 7432 8432 9432 10432)
     for port in "${ports[@]}"; do
@@ -33,9 +28,14 @@ if [ -n "$INTERACTIVE_TEST_ENVIRONMENT" ]; then
     PGPASSWORD=postgres psql -e -h 127.0.0.1 -p 8432  -U postgres -f /app/tests/sharding/query_routing_setup.sql
     PGPASSWORD=postgres psql -e -h 127.0.0.1 -p 9432  -U postgres -f /app/tests/sharding/query_routing_setup.sql
     PGPASSWORD=postgres psql -e -h 127.0.0.1 -p 10432 -U postgres -f /app/tests/sharding/query_routing_setup.sql
-    sleep 100000000000000000
+    sleep infinity
     exit 0
 fi
+
+rm -rf /app/target/ || true
+rm /app/*.profraw || true
+rm /app/pgcat.profdata || true
+rm -rf /app/cov || true
 
 export LLVM_PROFILE_FILE="/app/pgcat-%m-%p.profraw"
 export RUSTC_BOOTSTRAP=1

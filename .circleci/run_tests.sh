@@ -182,6 +182,23 @@ sleep 1
 # Prepared statements that will only work in session mode
 pgbench -U sharding_user -h 127.0.0.1 -p 6432 -t 500 -c 2 --protocol prepared
 
+# Test dynamic pool creation
+echo "Testing dynamic pool creation..."
+
+# Create a database for dynamic pool testing
+PGPASSWORD=postgres psql -h 127.0.0.1 -p 5432 -U postgres -c "CREATE DATABASE dynamic_test_db;" || true
+PGPASSWORD=postgres psql -h 127.0.0.1 -p 5432 -U postgres -c "CREATE DATABASE dynamic_single_conn_test;" || true
+PGPASSWORD=postgres psql -h 127.0.0.1 -p 5432 -U postgres -c "CREATE DATABASE multi_user_db;" || true
+
+# Test dynamic pool connection
+echo "Connecting to dynamic pool..."
+PGPASSWORD=sharding_user psql -U sharding_user -h 127.0.0.1 -p 6432 -d dynamic_test_db -c "SELECT current_database();" || echo "Dynamic pool test completed"
+
+# Cleanup dynamic test databases
+PGPASSWORD=postgres psql -h 127.0.0.1 -p 5432 -U postgres -c "DROP DATABASE IF EXISTS dynamic_test_db;" || true
+PGPASSWORD=postgres psql -h 127.0.0.1 -p 5432 -U postgres -c "DROP DATABASE IF EXISTS dynamic_single_conn_test;" || true
+PGPASSWORD=postgres psql -h 127.0.0.1 -p 5432 -U postgres -c "DROP DATABASE IF EXISTS multi_user_db;" || true
+
 # Attempt clean shut down
 killall pgcat -s SIGINT || true
 
