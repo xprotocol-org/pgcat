@@ -54,7 +54,7 @@ services:
       - /app/target/
     healthcheck:
       test: ["CMD", "test", "-f", "/tmp/.container_ready"]
-      interval: 1s
-      timeout: 1s
+      interval: 3s
+      timeout: 2s
       retries: 30
-      start_period: 5s
+      start_period: 30s

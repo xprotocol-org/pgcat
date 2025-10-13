@@ -91,7 +91,7 @@ impl PreparedStatementCache {
         match self.cache.get(&hash) {
             Some(rewritten_parse) => rewritten_parse.clone(),
             None => {
-                let new_parse = Arc::new(parse.clone().rewrite());
+                let new_parse = Arc::new(parse.clone().rewrite(hash));
                 let evicted = self.cache.push(hash, new_parse.clone());
 
                 if let Some((_, evicted_parse)) = evicted {

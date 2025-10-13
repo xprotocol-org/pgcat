@@ -7,7 +7,6 @@ use socket2::{SockRef, TcpKeepalive};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use crate::client::PREPARED_STATEMENT_COUNTER;
 use crate::config::get_config;
 use crate::errors::Error;
 
@@ -20,9 +19,25 @@ use std::hash::{Hash, Hasher};
 use std::io::{BufRead, Cursor};
 use std::mem;
 use std::str::FromStr;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
+
+fn base62_encode(mut num: u64) -> String {
+    const CHARS: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+
+    if num == 0 {
+        return "0".to_string();
+    }
+
+    let mut result = Vec::new();
+    while num > 0 {
+        result.push(CHARS[(num % 62) as usize]);
+        num /= 62;
+    }
+
+    result.reverse();
+    String::from_utf8(result).unwrap()
+}
 
 /// Postgres data type mappings
 /// used in RowDescription ('T') message.
@@ -189,9 +204,11 @@ pub fn parse_params(mut bytes: BytesMut) -> Result<HashMap<String, String>, Erro
     while bytes.has_remaining() {
         let mut c = bytes.get_u8();
 
-        // Null-terminated C-strings.
         while c != 0 {
             tmp.push(c as char);
+            if !bytes.has_remaining() {
+                return Err(Error::ClientBadStartup);
+            }
             c = bytes.get_u8();
         }
 
@@ -660,23 +677,31 @@ where
         }
     };
 
+    if len < 4 {
+        return Err(Error::SocketError(format!(
+            "Invalid message length {} for code {} (must be at least 4)",
+            len, code as char
+        )));
+    }
+
+    const MAX_MESSAGE_SIZE: i32 = 1024 * 1024 * 1024;
+    if len > MAX_MESSAGE_SIZE {
+        return Err(Error::SocketError(format!(
+            "Message length {} exceeds maximum {} for code {}",
+            len, MAX_MESSAGE_SIZE, code as char
+        )));
+    }
+
     let mut bytes = BytesMut::with_capacity(len as usize + 1);
 
     bytes.put_u8(code);
     bytes.put_i32(len);
 
-    bytes.resize(bytes.len() + len as usize - mem::size_of::<i32>(), b'0');
+    let body_len = (len as usize).saturating_sub(mem::size_of::<i32>());
+    bytes.resize(bytes.len() + body_len, b'0');
 
     let slice_start = mem::size_of::<u8>() + mem::size_of::<i32>();
-    let slice_end = slice_start + len as usize - mem::size_of::<i32>();
-
-    // Avoids a panic
-    if slice_end < slice_start {
-        return Err(Error::SocketError(format!(
-            "Error reading message from socket - Code: {:?} - Length {:?}, Error: {:?}",
-            code, len, "Unexpected length value for message"
-        )));
-    }
+    let slice_end = slice_start + body_len;
 
     match stream.read_exact(&mut bytes[slice_start..slice_end]).await {
         Ok(_) => (),
@@ -896,12 +921,8 @@ impl TryFrom<&Parse> for BytesMut {
 }
 
 impl Parse {
-    /// Renames the prepared statement to a new name based on the global counter
-    pub fn rewrite(mut self) -> Self {
-        self.name = format!(
-            "PGCAT_{}",
-            PREPARED_STATEMENT_COUNTER.fetch_add(1, Ordering::SeqCst)
-        );
+    pub fn rewrite(mut self, hash: u64) -> Self {
+        self.name = format!("PGCAT_{}", base62_encode(hash));
         self
     }
 
@@ -1292,9 +1313,6 @@ impl Display for PgErrorMsg {
         }
         if let Some(val) = &self.internal_position {
             write!(f, "[internal_position: {val}]")?;
-        }
-        if let Some(val) = &self.internal_query {
-            write!(f, "[internal_query: {val}]")?;
         }
         if let Some(val) = &self.internal_query {
             write!(f, "[internal_query: {val}]")?;

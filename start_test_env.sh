@@ -13,6 +13,7 @@ show_help() {
     echo "==================================="
     echo "Interactive test environment ready"
     echo "To run integration tests, you can use the following commands:"
+    echo -e "   ${BLUE}Ruby:   ${RED}cd /app/tests/ruby && bundle exec ruby tests.rb --format documentation${RESET}"
     echo -e "   ${BLUE}Ruby:   ${RED}cd /app/tests/ruby && bundle exec rspec *_spec.rb --format documentation${RESET}"
     echo -e "   ${BLUE}Python: ${RED}cd /app/ && pytest${RESET}"
     echo -e "   ${BLUE}Rust:   ${RED}cd /app/tests/rust && cargo run${RESET}"

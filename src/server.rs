@@ -1298,7 +1298,7 @@ impl Server {
 
         let res = self.query(&query).await;
 
-        self.cleanup_state.reset();
+        self.cleanup_state.needs_cleanup_set = false;
 
         res
     }

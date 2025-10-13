@@ -3,9 +3,8 @@ use crate::pool::BanReason;
 /// Handle clients by pretending to be a PostgreSQL server.
 use bytes::{Buf, BufMut, BytesMut};
 use log::{debug, error, info, trace, warn};
-use once_cell::sync::Lazy;
 use std::collections::{HashMap, VecDeque};
-use std::sync::{atomic::AtomicUsize, Arc};
+use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::{split, AsyncReadExt, BufReader, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
@@ -27,11 +26,6 @@ use crate::stats::{ClientStats, ServerStats};
 use crate::tls::Tls;
 
 use tokio_rustls::server::TlsStream;
-
-/// Incrementally count prepared statements
-/// to avoid random conflicts in places where the random number generator is weak.
-pub static PREPARED_STATEMENT_COUNTER: Lazy<Arc<AtomicUsize>> =
-    Lazy::new(|| Arc::new(AtomicUsize::new(0)));
 
 /// Type of connection received from client.
 enum ClientConnectionType {
@@ -956,6 +950,21 @@ where
             match message[0] as char {
                 // Query
                 'Q' => {
+                    if !self.extended_protocol_data_buffer.is_empty() {
+                        error!(
+                            "Simple query received with {} pending extended protocol messages (client: {})",
+                            self.extended_protocol_data_buffer.len(),
+                            client_identifier
+                        );
+                        self.reset_buffered_state();
+                        error_response(
+                            &mut self.write,
+                            "protocol violation: simple query with pending extended protocol messages",
+                        )
+                        .await?;
+                        continue;
+                    }
+
                     if query_router.query_parser_enabled() {
                         match query_router.parse(&message) {
                             Ok(ast) => {
@@ -1076,6 +1085,8 @@ where
                 self.stats.waiting();
             }
 
+            let checkout_limit = pool.settings.checkout_failure_limit.unwrap_or(u64::MAX);
+
             let (mut reference, address) = loop {
                 let connection = match pool
                     .get(query_router.shard(), query_router.role(), &self.stats)
@@ -1115,24 +1126,6 @@ where
                             err
                         );
                         checkout_failure_count += 1;
-                        if let Some(limit) = pool.settings.checkout_failure_limit {
-                            if checkout_failure_count >= limit {
-                                error!(
-                                    "Checkout failure limit reached ({} / {}) - disconnecting client",
-                                    checkout_failure_count, limit
-                                );
-                                error_response_terminal(
-                                    &mut self.write,
-                                    &format!(
-                                        "checkout failure limit reached ({} / {})",
-                                        checkout_failure_count, limit
-                                    ),
-                                )
-                                .await?;
-                                self.stats.disconnect();
-                                return Ok(());
-                            }
-                        }
                         continue;
                     }
                 };
@@ -1141,43 +1134,40 @@ where
                 let address = connection.1;
                 let server = &mut *reference;
 
-                if !self.transaction_mode {
-                    if let Err(err) = server.query(";").await {
-                        warn!(
-                            "Session mode: connection validation failed on checkout from pool, retrying with another connection: {:?}",
-                            err
-                        );
-                        server.mark_bad("session mode checkout validation failed");
+                if let Err(err) = server.query(";").await {
+                    warn!(
+                        "Session mode: connection validation failed on checkout from pool, retrying with another connection: {:?}",
+                        err
+                    );
+                    server.mark_bad("session mode checkout validation failed");
 
-                        pool.ban(&address, BanReason::FailedHealthCheck, Some(&self.stats));
+                    pool.ban(&address, BanReason::FailedHealthCheck, Some(&self.stats));
 
-                        drop(reference);
+                    drop(reference);
 
-                        checkout_failure_count += 1;
-                        if let Some(limit) = pool.settings.checkout_failure_limit {
-                            if checkout_failure_count >= limit {
-                                error!(
-                                    "Connection validation failure limit reached ({} / {}) - disconnecting client",
-                                    checkout_failure_count, limit
-                                );
-                                self.stats.idle();
-                                error_response_terminal(
-                                    &mut self.write,
-                                    &format!(
-                                        "connection validation failure limit reached ({} / {})",
-                                        checkout_failure_count, limit
-                                    ),
-                                )
-                                .await?;
-                                self.stats.disconnect();
-                                return Ok(());
-                            }
-                        }
-
-                        continue;
-                    }
-                    debug!("Session mode: connection validated on checkout");
+                    checkout_failure_count += 1;
+                    continue;
                 }
+
+                if checkout_failure_count >= checkout_limit {
+                    error!(
+                        "Checkout failure limit reached ({} / {}) - disconnecting client",
+                        checkout_failure_count, checkout_limit
+                    );
+                    self.stats.idle();
+                    error_response_terminal(
+                        &mut self.write,
+                        &format!(
+                            "checkout failure limit reached ({} / {})",
+                            checkout_failure_count, checkout_limit
+                        ),
+                    )
+                    .await?;
+                    self.stats.disconnect();
+                    return Ok(());
+                }
+
+                debug!("Connection validated on checkout");
 
                 break (reference, address);
             };
@@ -1239,8 +1229,6 @@ where
                                 return Err(err);
                             }
                             Err(_) => {
-                                // Client idle in transaction timeout
-                                error_response(&mut self.write, "idle transaction timeout").await?;
                                 error!(
                                     "Client idle in transaction timeout: \
                                     {{ \
@@ -1254,6 +1242,13 @@ where
                                     query_router.shard(),
                                     query_router.role()
                                 );
+
+                                if let Err(cleanup_err) = server.checkin_cleanup().await {
+                                    warn!("Failed to cleanup server connection after idle timeout, connection will be discarded: {:?}", cleanup_err);
+                                    server.mark_bad("checkin_cleanup failed after idle timeout");
+                                }
+
+                                error_response(&mut self.write, "idle transaction timeout").await?;
 
                                 break;
                             }
@@ -1606,10 +1601,15 @@ where
 
                         // Want to limit buffer size
                         if self.buffer.len() > 8196 {
-                            // Forward the data to the server,
-                            self.send_server_message(server, &self.buffer, &address, &pool)
-                                .await?;
-                            self.buffer.clear();
+                            match self.send_server_message(server, &self.buffer, &address, &pool).await {
+                                Ok(_) => {
+                                    self.buffer.clear();
+                                }
+                                Err(err) => {
+                                    self.buffer.clear();
+                                    return Err(err);
+                                }
+                            }
                         }
                     }
 
@@ -1619,11 +1619,15 @@ where
                         // We may already have some copy data in the buffer, add this message to buffer
                         self.buffer.put(&message[..]);
 
-                        self.send_server_message(server, &self.buffer, &address, &pool)
-                            .await?;
-
-                        // Clear the buffer
-                        self.buffer.clear();
+                        match self.send_server_message(server, &self.buffer, &address, &pool).await {
+                            Ok(_) => {
+                                self.buffer.clear();
+                            }
+                            Err(err) => {
+                                self.buffer.clear();
+                                return Err(err);
+                            }
+                        }
 
                         let response = self
                             .receive_server_message(server, &address, &pool, &self.stats.clone())
@@ -1894,6 +1898,14 @@ where
 
         self.prepared_statements
             .insert(client_given_name, (new_parse.clone(), hash));
+
+        let cache_size = self.prepared_statements.len();
+        if cache_size > 0 && cache_size % 100 == 0 {
+            warn!(
+                "Client {} has {} prepared statements cached (pool: {}, user: {})",
+                self.addr, cache_size, self.pool_name, self.username
+            );
+        }
 
         self.extended_protocol_data_buffer
             .push_back(ExtendedProtocolData::create_new_parse(
