@@ -1305,6 +1305,18 @@ where
 
                                     _ => (),
                                 };
+
+                                for key in query_router.extract_advisory_lock_keys(&ast) {
+                                    server.add_advisory_lock(key);
+                                }
+
+                                for key in query_router.extract_advisory_unlock_keys(&ast) {
+                                    server.remove_advisory_lock(key);
+                                }
+
+                                if query_router.has_advisory_unlock_all(&ast) {
+                                    server.clear_all_advisory_locks();
+                                }
                             }
                         }
 
@@ -1320,7 +1332,7 @@ where
                         )
                         .await?;
 
-                        if !server.in_transaction() {
+                        if !server.in_transaction() && !server.has_advisory_locks() {
                             // Report transaction executed statistics.
                             self.stats.transaction();
                             server
@@ -1358,6 +1370,18 @@ where
                                 if let Ok(output) = query_router.execute_plugins(&ast).await {
                                     plugin_output = Some(output);
                                 }
+
+                                for key in query_router.extract_advisory_lock_keys(&ast) {
+                                    server.add_advisory_lock(key);
+                                }
+
+                                for key in query_router.extract_advisory_unlock_keys(&ast) {
+                                    server.remove_advisory_lock(key);
+                                }
+
+                                if query_router.has_advisory_unlock_all(&ast) {
+                                    server.clear_all_advisory_locks();
+                                }
                             }
                         }
 
@@ -1367,6 +1391,10 @@ where
                     // Bind
                     // The placeholder's replacements are here, e.g. 'user@email.com' and 'true'
                     'B' => {
+                        let keys = query_router.extract_advisory_lock_keys_from_bind(&message);
+                        for key in keys {
+                            server.add_advisory_lock(key);
+                        }
                         self.buffer_bind(message).await?;
                     }
 
@@ -1581,7 +1609,7 @@ where
 
                         self.buffer.clear();
 
-                        if !server.in_transaction() {
+                        if !server.in_transaction() && !server.has_advisory_locks() {
                             self.stats.transaction();
                             server
                                 .stats()
@@ -1641,7 +1669,7 @@ where
                             }
                         };
 
-                        if !server.in_transaction() {
+                        if !server.in_transaction() && !server.has_advisory_locks() {
                             self.stats.transaction();
                             server
                                 .stats()

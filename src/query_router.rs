@@ -419,6 +419,94 @@ impl QueryRouter {
         }
     }
 
+    pub fn extract_advisory_lock_keys(&self, ast: &Vec<Statement>) -> Vec<i64> {
+        let mut keys = Vec::new();
+
+        for statement in ast {
+            if let Statement::Query(query) = statement {
+                if let SetExpr::Select(select) = query.body.as_ref() {
+                    for projection in &select.projection {
+                        if let sqlparser::ast::SelectItem::UnnamedExpr(expr) = projection {
+                            if let Some(key) = self.extract_lock_key_from_expr(expr, true) {
+                                keys.push(key);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        keys
+    }
+
+    pub fn extract_advisory_unlock_keys(&self, ast: &Vec<Statement>) -> Vec<i64> {
+        let mut keys = Vec::new();
+
+        for statement in ast {
+            if let Statement::Query(query) = statement {
+                if let SetExpr::Select(select) = query.body.as_ref() {
+                    for projection in &select.projection {
+                        if let sqlparser::ast::SelectItem::UnnamedExpr(expr) = projection {
+                            if let Some(key) = self.extract_lock_key_from_expr(expr, false) {
+                                keys.push(key);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        keys
+    }
+
+    pub fn has_advisory_unlock_all(&self, ast: &Vec<Statement>) -> bool {
+        for statement in ast {
+            let query_str = statement.to_string().to_ascii_lowercase();
+            if query_str.contains("pg_advisory_unlock_all()") {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn extract_lock_key_from_expr(&self, expr: &Expr, is_lock: bool) -> Option<i64> {
+        if let Expr::Function(func) = expr {
+            let func_name = func.name.to_string().to_lowercase();
+
+            let is_lock_func = is_lock && (
+                func_name.contains("pg_advisory_lock") ||
+                func_name.contains("pg_try_advisory_lock")
+            ) && !func_name.contains("xact");
+
+            let is_unlock_func = !is_lock && (
+                func_name.contains("pg_advisory_unlock") &&
+                !func_name.contains("_all")
+            );
+
+            if is_lock_func || is_unlock_func {
+                match &func.args {
+                    sqlparser::ast::FunctionArguments::List(sqlparser::ast::FunctionArgumentList { args, .. }) => {
+                        if let Some(sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(arg_expr))) = args.first() {
+                            return self.extract_i64_from_expr(arg_expr);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        None
+    }
+
+    fn extract_i64_from_expr(&self, expr: &Expr) -> Option<i64> {
+        match expr {
+            Expr::Value(Value::Number(num_str, _)) => {
+                num_str.parse::<i64>().ok()
+            }
+            _ => None,
+        }
+    }
+
     fn database_activity_cache(&self) -> Cache<String, DatabaseActivityState> {
         DATABASE_ACTIVITY_CACHE
             .get_or_init(|| {
@@ -804,6 +892,108 @@ impl QueryRouter {
         table_names.push(name.0.clone())
     }
 
+    /// Extract i64 parameter values from Bind message for specified placeholders
+    fn extract_bind_parameters(&mut self, message: &BytesMut) -> Vec<i64> {
+        let mut values = Vec::new();
+        
+        if self.placeholders.is_empty() {
+            return values;
+        }
+        
+        let mut message_cursor = Cursor::new(message);
+        let code = message_cursor.get_u8() as char;
+        
+        if code != 'B' {
+            return values;
+        }
+        
+        message_cursor.advance(mem::size_of::<i32>());
+        let _portal = match message_cursor.read_string() {
+            Ok(portal) => portal,
+            Err(_) => return values,
+        };
+        let _prepared_statement = match message_cursor.read_string() {
+            Ok(ps) => ps,
+            Err(_) => return values,
+        };
+        
+        let num_parameter_format_codes = message_cursor.get_i16();
+        let parameter_format = match num_parameter_format_codes {
+            0 => ParameterFormat::Text,
+            1 => {
+                let format_code = message_cursor.get_i16();
+                ParameterFormat::Uniform(Box::new(match format_code {
+                    0 => ParameterFormat::Text,
+                    1 => ParameterFormat::Binary,
+                    _ => return values,
+                }))
+            }
+            _ => {
+                let mut formats = Vec::new();
+                for _ in 0..num_parameter_format_codes {
+                    formats.push(match message_cursor.get_i16() {
+                        0 => ParameterFormat::Text,
+                        1 => ParameterFormat::Binary,
+                        _ => return values,
+                    });
+                }
+                ParameterFormat::Specified(formats)
+            }
+        };
+        
+        let num_parameters = message_cursor.get_i16();
+        
+        for i in 0..num_parameters {
+            let mut len = message_cursor.get_i32() as usize;
+            let format = match &parameter_format {
+                ParameterFormat::Text => ParameterFormat::Text,
+                ParameterFormat::Uniform(format) => *format.clone(),
+                ParameterFormat::Specified(formats) => formats[i as usize].clone(),
+                _ => continue,
+            };
+            
+            let placeholder = i + 1;
+            
+            if self.placeholders.contains(&placeholder) {
+                let value = match format {
+                    ParameterFormat::Text => {
+                        let mut value = String::new();
+                        while len > 0 {
+                            value.push(message_cursor.get_u8() as char);
+                            len -= 1;
+                        }
+                        
+                        match value.parse::<i64>() {
+                            Ok(value) => value,
+                            Err(_) => continue,
+                        }
+                    }
+                    
+                    ParameterFormat::Binary => match len {
+                        2 => message_cursor.get_i16() as i64,
+                        4 => message_cursor.get_i32() as i64,
+                        8 => message_cursor.get_i64(),
+                        _ => continue,
+                    },
+                    
+                    _ => continue,
+                };
+                
+                values.push(value);
+            } else if len > 0 {
+                message_cursor.advance(len);
+            }
+        }
+        
+        self.placeholders.clear();
+        values
+    }
+
+    /// Extract advisory lock keys from Bind message parameters
+    pub fn extract_advisory_lock_keys_from_bind(&mut self, message: &BytesMut) -> Vec<i64> {
+        self.extract_bind_parameters(message)
+    }
+
     /// Parse the shard number from the Bind message
     /// which contains the arguments for a prepared statement.
     ///
@@ -811,34 +1001,15 @@ impl QueryRouter {
     /// keep a cache of them in PgCat.
     pub fn infer_shard_from_bind(&mut self, message: &BytesMut) -> bool {
         if !self.pool_settings.query_parser_read_write_splitting {
-            return false; // Nothing to do
+            return false;
         }
 
         debug!("Parsing bind message");
 
-        let mut message_cursor = Cursor::new(message);
-
-        let code = message_cursor.get_u8() as char;
-        let len = message_cursor.get_i32();
-
-        if code != 'B' {
-            debug!("Not a bind packet");
-            return false;
-        }
-
-        // Check message length
-        if message.len() != len as usize + 1 {
-            debug!(
-                "Message has wrong length, expected {}, but have {}",
-                len,
-                message.len()
-            );
-            return false;
-        }
-
-        // There are no shard keys in the prepared statement.
-        if self.placeholders.is_empty() {
-            debug!("There are no placeholders in the prepared statement that matched the automatic sharding key");
+        let values = self.extract_bind_parameters(message);
+        
+        if values.is_empty() {
+            debug!("No shard key values found in bind message");
             return false;
         }
 
@@ -848,90 +1019,10 @@ impl QueryRouter {
         );
 
         let mut shards = BTreeSet::new();
-
-        let _portal = message_cursor.read_string();
-        let _name = message_cursor.read_string();
-
-        let num_params = message_cursor.get_i16();
-        let parameter_format = match num_params {
-            0 => ParameterFormat::Text, // Text
-            1 => {
-                let param_format = message_cursor.get_i16();
-                ParameterFormat::Uniform(match param_format {
-                    0 => Box::new(ParameterFormat::Text),
-                    1 => Box::new(ParameterFormat::Binary),
-                    _ => unreachable!(),
-                })
-            }
-            n => {
-                let mut v = Vec::with_capacity(n as usize);
-                for _ in 0..n {
-                    let param_format = message_cursor.get_i16();
-                    v.push(match param_format {
-                        0 => ParameterFormat::Text,
-                        1 => ParameterFormat::Binary,
-                        _ => unreachable!(),
-                    });
-                }
-                ParameterFormat::Specified(v)
-            }
-        };
-
-        let num_parameters = message_cursor.get_i16();
-
-        for i in 0..num_parameters {
-            let mut len = message_cursor.get_i32() as usize;
-            let format = match &parameter_format {
-                ParameterFormat::Text => ParameterFormat::Text,
-                ParameterFormat::Uniform(format) => *format.clone(),
-                ParameterFormat::Specified(formats) => formats[i as usize].clone(),
-                _ => unreachable!(),
-            };
-
-            debug!("Parameter {} (len: {}): {:?}", i, len, format);
-
-            // Postgres counts placeholders starting at 1
-            let placeholder = i + 1;
-
-            if self.placeholders.contains(&placeholder) {
-                let value = match format {
-                    ParameterFormat::Text => {
-                        let mut value = String::new();
-                        while len > 0 {
-                            value.push(message_cursor.get_u8() as char);
-                            len -= 1;
-                        }
-
-                        match value.parse::<i64>() {
-                            Ok(value) => value,
-                            Err(_) => {
-                                debug!("Error parsing bind value: {}", value);
-                                continue;
-                            }
-                        }
-                    }
-
-                    ParameterFormat::Binary => match len {
-                        2 => message_cursor.get_i16() as i64,
-                        4 => message_cursor.get_i32() as i64,
-                        8 => message_cursor.get_i64(),
-                        _ => {
-                            error!(
-                                "Got wrong length for integer type parameter in bind: {}",
-                                len
-                            );
-                            continue;
-                        }
-                    },
-
-                    _ => unreachable!(),
-                };
-
-                shards.insert(sharder.shard(value));
-            }
+        for value in values {
+            shards.insert(sharder.shard(value));
         }
 
-        self.placeholders.clear();
         self.placeholders.shrink_to_fit();
 
         // We only support querying one shard at a time.

@@ -107,13 +107,15 @@ impl StreamInner {
     }
 }
 
-#[derive(Copy, Clone)]
+#[derive(Clone)]
 struct CleanupState {
     /// If server connection requires RESET ALL before checkin because of set statement
     needs_cleanup_set: bool,
 
     /// If server connection requires DEALLOCATE ALL before checkin because of prepare statement
     needs_cleanup_prepare: bool,
+
+    advisory_locks: HashSet<i64>,
 }
 
 impl CleanupState {
@@ -121,11 +123,12 @@ impl CleanupState {
         CleanupState {
             needs_cleanup_set: false,
             needs_cleanup_prepare: false,
+            advisory_locks: HashSet::new(),
         }
     }
 
     fn needs_cleanup(&self) -> bool {
-        self.needs_cleanup_set || self.needs_cleanup_prepare
+        self.needs_cleanup_set || self.needs_cleanup_prepare || !self.advisory_locks.is_empty()
     }
 
     fn set_true(&mut self) {
@@ -136,6 +139,7 @@ impl CleanupState {
     fn reset(&mut self) {
         self.needs_cleanup_set = false;
         self.needs_cleanup_prepare = false;
+        self.advisory_locks.clear();
     }
 }
 
@@ -143,8 +147,8 @@ impl std::fmt::Display for CleanupState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "SET: {}, PREPARE: {}",
-            self.needs_cleanup_set, self.needs_cleanup_prepare
+            "SET: {}, PREPARE: {}, ADVISORY_LOCKS: {:?}",
+            self.needs_cleanup_set, self.needs_cleanup_prepare, self.advisory_locks
         )
     }
 }
@@ -1245,6 +1249,10 @@ impl Server {
         self.in_transaction
     }
 
+    pub fn has_advisory_locks(&self) -> bool {
+        !self.cleanup_state.advisory_locks.is_empty()
+    }
+
     /// Currently copying data from client to server or vice-versa.
     pub fn in_copy_mode(&self) -> bool {
         self.in_copy_mode
@@ -1377,6 +1385,10 @@ impl Server {
                 }
             };
 
+            if !self.cleanup_state.advisory_locks.is_empty() {
+                reset_string.push_str("SELECT pg_advisory_unlock_all();");
+            };
+
             self.query(&reset_string).await?;
             self.cleanup_state.reset();
         }
@@ -1407,6 +1419,18 @@ impl Server {
     // Marks a connection as needing cleanup at checkin
     pub fn mark_dirty(&mut self) {
         self.cleanup_state.set_true();
+    }
+
+    pub fn add_advisory_lock(&mut self, key: i64) {
+        self.cleanup_state.advisory_locks.insert(key);
+    }
+
+    pub fn remove_advisory_lock(&mut self, key: i64) {
+        self.cleanup_state.advisory_locks.remove(&key);
+    }
+
+    pub fn clear_all_advisory_locks(&mut self) {
+        self.cleanup_state.advisory_locks.clear();
     }
 
     pub fn mirror_send(&mut self, bytes: &BytesMut) {
