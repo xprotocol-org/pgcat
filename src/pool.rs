@@ -371,7 +371,7 @@ impl ConnectionPool {
         client_server_map: &ClientServerMap,
         address_id: &mut usize,
     ) -> Result<ConnectionPool, Error> {
-        let shard_ids = Self::extract_sorted_shard_ids(pool_config);
+        let shard_ids = Self::extract_sorted_shard_ids(pool_config)?;
         let pool_auth_hash = Arc::new(RwLock::new(None));
 
         let (shards, addresses, banlist) = Self::build_shards(
@@ -386,7 +386,14 @@ impl ConnectionPool {
         )
         .await?;
 
-        assert_eq!(shards.len(), addresses.len());
+        if shards.len() != addresses.len() {
+            error!(
+                "Pool configuration error: shard count ({}) does not match address count ({})",
+                shards.len(),
+                addresses.len()
+            );
+            return Err(Error::BadConfig);
+        }
 
         Self::log_auth_status(&pool_auth_hash, pool_name, &user.username);
 
@@ -411,10 +418,24 @@ impl ConnectionPool {
         })
     }
 
-    fn extract_sorted_shard_ids(pool_config: &crate::config::Pool) -> Vec<String> {
+    fn extract_sorted_shard_ids(pool_config: &crate::config::Pool) -> Result<Vec<String>, Error> {
         let mut shard_ids: Vec<String> = pool_config.shards.keys().cloned().collect();
-        shard_ids.sort_by_key(|k| k.parse::<i64>().unwrap());
-        shard_ids
+        shard_ids.sort_by_key(|k| {
+            k.parse::<i64>()
+                .unwrap_or_else(|_| {
+                    error!("Invalid shard id '{}': must be a valid integer", k);
+                    i64::MAX
+                })
+        });
+
+        for id in &shard_ids {
+            if id.parse::<i64>().is_err() {
+                error!("Invalid shard id '{}': must be a valid integer", id);
+                return Err(Error::BadConfig);
+            }
+        }
+
+        Ok(shard_ids)
     }
 
     async fn build_shards(
@@ -466,6 +487,11 @@ impl ConnectionPool {
         pool_auth_hash: &Arc<RwLock<Option<String>>>,
         address_id: &mut usize,
     ) -> Result<(Vec<Pool<ServerPool>>, Vec<Address>), Error> {
+        if shard_config.servers.is_empty() {
+            error!("Shard '{}' has no servers configured", shard_idx);
+            return Err(Error::BadConfig);
+        }
+
         let mut pools = Vec::new();
         let mut addresses = Vec::new();
         let mut replica_number = 0;
@@ -528,6 +554,11 @@ impl ConnectionPool {
             address_id,
         );
 
+        let shard_number = shard_idx.parse::<usize>().unwrap_or_else(|e| {
+            error!("Failed to parse shard index '{}': {}", shard_idx, e);
+            0
+        });
+
         let address = Address {
             id: *address_id,
             database: shard_config.database.clone(),
@@ -536,7 +567,7 @@ impl ConnectionPool {
             role: server_config.role,
             address_index,
             replica_number,
-            shard: shard_idx.parse::<usize>().unwrap(),
+            shard: shard_number,
             username: user.username.clone(),
             pool_name: pool_name.to_string(),
             mirrors: mirror_addresses,
@@ -562,6 +593,11 @@ impl ConnectionPool {
             return Vec::new();
         };
 
+        let shard_number = shard_idx.parse::<usize>().unwrap_or_else(|e| {
+            error!("Failed to parse shard index '{}' for mirror: {}", shard_idx, e);
+            0
+        });
+
         mirrors
             .iter()
             .enumerate()
@@ -575,7 +611,7 @@ impl ConnectionPool {
                     role: server_config.role,
                     address_index: mirror_idx,
                     replica_number,
-                    shard: shard_idx.parse::<usize>().unwrap(),
+                    shard: shard_number,
                     username: user.username.clone(),
                     pool_name: pool_name.to_string(),
                     mirrors: vec![],
@@ -633,6 +669,16 @@ impl ConnectionPool {
         pool_auth_hash: &Arc<RwLock<Option<String>>>,
         pool_name: &str,
     ) -> Result<Pool<ServerPool>, Error> {
+        if let Some(min_size) = user.min_pool_size {
+            if min_size > user.pool_size {
+                error!(
+                    "Invalid pool configuration for user '{}': min_pool_size ({}) cannot exceed pool_size ({})",
+                    user.username, min_size, user.pool_size
+                );
+                return Err(Error::BadConfig);
+            }
+        }
+
         let plugins = pool_config.plugins.clone().or_else(|| config.plugins.clone());
 
         let manager = ServerPool::new(
@@ -664,7 +710,13 @@ impl ConnectionPool {
             .test_on_check_out(false);
 
         if config.general.validate_config {
-            builder.build(manager).await
+            builder.build(manager).await.map_err(|e| {
+                error!(
+                    "Failed to build connection pool for {}:{} (shard: {}, database: {}): {}",
+                    address.host, address.port, address.shard, shard_config.database, e
+                );
+                Error::ServerError
+            })
         } else {
             Ok(builder.build_unchecked(manager))
         }
@@ -1577,10 +1629,27 @@ mod tests {
             },
         );
 
-        let shard_ids = ConnectionPool::extract_sorted_shard_ids(&pool_config);
+        let shard_ids = ConnectionPool::extract_sorted_shard_ids(&pool_config).unwrap();
 
         assert_eq!(shard_ids.len(), 3);
         assert_eq!(shard_ids, vec!["0", "1", "2"]);
+    }
+
+    #[test]
+    fn test_extract_sorted_shard_ids_invalid() {
+        let mut pool_config = create_test_pool_config();
+        pool_config.shards.insert(
+            "invalid".to_string(),
+            Shard {
+                database: "test_db".to_string(),
+                servers: vec![],
+                mirrors: None,
+            },
+        );
+
+        let result = ConnectionPool::extract_sorted_shard_ids(&pool_config);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), Error::BadConfig);
     }
 
     #[test]
