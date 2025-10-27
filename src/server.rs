@@ -285,6 +285,12 @@ pub struct Server {
     /// Is the server inside a transaction or idle.
     in_transaction: bool,
 
+    /// Set of advisory lock keys currently held by this connection.
+    advisory_lock_keys: std::collections::HashSet<i64>,
+
+    /// Pending advisory lock action awaiting server response.
+    pending_advisory_lock_action: Option<(crate::query_router::AdvisoryLockAction, Option<i64>)>,
+
     /// Is there more data for the client to read.
     data_available: bool,
 
@@ -804,6 +810,8 @@ impl Server {
                         process_id,
                         secret_key,
                         in_transaction: false,
+                        advisory_lock_keys: std::collections::HashSet::new(),
+                        pending_advisory_lock_action: None,
                         in_copy_mode: false,
                         data_available: false,
                         bad: false,
@@ -1245,6 +1253,94 @@ impl Server {
         self.in_transaction
     }
 
+    pub fn has_advisory_lock(&self) -> bool {
+        !self.advisory_lock_keys.is_empty()
+    }
+
+    pub fn set_pending_advisory_lock_action(
+        &mut self,
+        action: crate::query_router::AdvisoryLockAction,
+        key: Option<i64>,
+    ) {
+        self.pending_advisory_lock_action = Some((action, key));
+    }
+
+    pub fn process_advisory_lock_response(&mut self, response: &BytesMut) {
+        use crate::query_router::AdvisoryLockAction;
+
+        if self.pending_advisory_lock_action.is_none() {
+            return;
+        }
+
+        debug!("Processing advisory lock response, pending action: {:?}", self.pending_advisory_lock_action);
+
+        let mut cursor = std::io::Cursor::new(response);
+        use bytes::Buf;
+
+        while cursor.has_remaining() {
+            if cursor.remaining() < 5 {
+                break;
+            }
+
+            let code = cursor.get_u8() as char;
+            let len = cursor.get_i32() as usize;
+
+            if code == 'D' && len >= 4 {
+                let remaining_in_msg = len - 4;
+                if cursor.remaining() < remaining_in_msg {
+                    break;
+                }
+
+                let data_start = cursor.position() as usize;
+                let data_end = data_start + remaining_in_msg;
+                let data_row = &response[data_start..data_end];
+
+                let has_true_value = data_row.windows(2).any(|w| w == b"\x00t" || w == [0x01, b't']);
+
+                if let Some((action, key_opt)) = self.pending_advisory_lock_action.take() {
+                    debug!("DataRow found, has_true_value: {}, action: {:?}, key: {:?}", has_true_value, action, key_opt);
+                    match action {
+                        AdvisoryLockAction::Lock => {
+                            if has_true_value {
+                                if let Some(key) = key_opt {
+                                    debug!("Session-scoped advisory lock acquired for key: {}", key);
+                                    self.advisory_lock_keys.insert(key);
+                                    debug!("Advisory lock keys now: {:?}", self.advisory_lock_keys);
+                                } else {
+                                    debug!("Session-scoped advisory lock acquired (key not tracked)");
+                                }
+                            } else {
+                                debug!("Lock acquisition returned false, not tracking");
+                            }
+                        }
+                        AdvisoryLockAction::Unlock => {
+                            if has_true_value {
+                                if let Some(key) = key_opt {
+                                    debug!("Advisory lock released for key: {}", key);
+                                    self.advisory_lock_keys.remove(&key);
+                                } else {
+                                    debug!("Advisory lock released (key not tracked)");
+                                }
+                            }
+                        }
+                        AdvisoryLockAction::UnlockAll => {
+                            if has_true_value {
+                                debug!("All advisory locks released");
+                                self.advisory_lock_keys.clear();
+                            }
+                        }
+                    }
+                }
+
+                break;
+            } else if len >= 4 && cursor.remaining() >= len - 4 {
+                cursor.advance(len - 4);
+            } else {
+                break;
+            }
+        }
+    }
+
     /// Currently copying data from client to server or vice-versa.
     pub fn in_copy_mode(&self) -> bool {
         self.in_copy_mode
@@ -1354,6 +1450,12 @@ impl Server {
         if self.in_transaction() {
             warn!(target: "pgcat::server::cleanup", "Server returned while still in transaction, rolling back transaction");
             self.query("ROLLBACK").await?;
+        }
+
+        if self.has_advisory_lock() {
+            warn!(target: "pgcat::server::cleanup", "Server returned with advisory locks held, releasing all locks");
+            self.query("SELECT pg_advisory_unlock_all()").await?;
+            self.advisory_lock_keys.clear();
         }
 
         // Client disconnected but it performed session-altering operations such as
