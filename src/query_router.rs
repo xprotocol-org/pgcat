@@ -55,6 +55,14 @@ pub enum ShardingKey {
     Placeholder(i16),
 }
 
+#[derive(PartialEq, Debug, Clone)]
+pub enum AdvisoryLockAction {
+    Lock,
+    TryLock,
+    Unlock,
+    UnlockAll,
+}
+
 #[derive(Clone, Debug)]
 enum ParameterFormat {
     Text,
@@ -68,6 +76,8 @@ static CUSTOM_SQL_REGEX_SET: OnceCell<RegexSet> = OnceCell::new();
 
 // Get the value inside the custom command.
 static CUSTOM_SQL_REGEX_LIST: OnceCell<Vec<Regex>> = OnceCell::new();
+
+static ADVISORY_LOCK_REGEX: OnceCell<Regex> = OnceCell::new();
 
 #[derive(Debug, Clone, PartialEq)]
 enum DatabaseActivityState {
@@ -100,6 +110,12 @@ pub struct QueryRouter {
 
     // Placeholders from prepared statement.
     placeholders: Vec<i16>,
+
+    // Pending advisory lock action from Parse that needs Bind parameters
+    pending_advisory_lock_parse: Option<(AdvisoryLockAction, Vec<i16>)>,
+
+    // Advisory lock action and keys extracted from Bind, ready to be set on server
+    pending_advisory_lock_action: Option<(AdvisoryLockAction, Vec<i64>)>,
 }
 
 struct ExtractedExprsAndTables<'a> {
@@ -132,6 +148,23 @@ impl QueryRouter {
             Err(_) => return false,
         };
 
+        let advisory_lock_regex = match Regex::new(
+            r"(?i)pg_(try_)?advisory_(xact_)?(lock|unlock)(_all|_shared)?",
+        ) {
+            Ok(rgx) => rgx,
+            Err(err) => {
+                error!(
+                    "QueryRouter::setup Could not compile advisory lock regex: {:?}",
+                    err
+                );
+                return false;
+            }
+        };
+
+        if ADVISORY_LOCK_REGEX.set(advisory_lock_regex).is_err() {
+            return false;
+        }
+
         CUSTOM_SQL_REGEX_SET.set(set).is_ok()
     }
 
@@ -145,6 +178,8 @@ impl QueryRouter {
             primary_reads_enabled: None,
             pool_settings: PoolSettings::default(),
             placeholders: Vec::new(),
+            pending_advisory_lock_parse: None,
+            pending_advisory_lock_action: None,
         }
     }
 
@@ -1266,6 +1301,235 @@ impl QueryRouter {
             Some(value) => value,
         }
     }
+
+    pub fn contains_session_advisory_lock(&mut self, message: &BytesMut) -> Option<(AdvisoryLockAction, Vec<i64>)> {
+        let advisory_lock_regex = ADVISORY_LOCK_REGEX.get()?;
+
+        let mut message_cursor = Cursor::new(message);
+        let code = message_cursor.get_u8() as char;
+        let _len = message_cursor.get_i32();
+
+        let query = match code {
+            'Q' => {
+                let query = message_cursor.read_string().ok()?;
+                query
+            }
+            'P' => {
+                let _name = message_cursor.read_string().ok()?;
+                let query = message_cursor.read_string().ok()?;
+                query
+            }
+            _ => return None,
+        };
+
+        debug!("Checking query for advisory lock: {}", query);
+
+        if !advisory_lock_regex.is_match(&query) {
+            debug!("Query does not match advisory lock regex");
+            return None;
+        }
+
+        let query_lower = query.to_lowercase();
+
+        if query_lower.contains("pg_advisory_xact_") {
+            debug!("Transaction-scoped advisory lock detected, routing to primary but no connection pinning needed");
+            self.active_role = Some(Role::Primary);
+            return None;
+        }
+
+        debug!("Session-scoped advisory lock query detected, routing to primary");
+        self.active_role = Some(Role::Primary);
+
+        let action = if query_lower.contains("pg_advisory_unlock_all") {
+            AdvisoryLockAction::UnlockAll
+        } else if query_lower.contains("pg_advisory_unlock") {
+            AdvisoryLockAction::Unlock
+        } else if query_lower.contains("pg_try_advisory_lock") {
+            AdvisoryLockAction::TryLock
+        } else {
+            AdvisoryLockAction::Lock
+        };
+
+        let (keys, placeholders) = self.extract_advisory_lock_key_or_placeholders(&query);
+
+        if !placeholders.is_empty() {
+            debug!("Advisory lock query uses placeholders, will extract keys from Bind message");
+            self.pending_advisory_lock_parse = Some((action.clone(), placeholders));
+            // Return None to indicate we need to wait for Bind message to get the keys
+            // but routing to primary is already set above
+            return None;
+        }
+
+        Some((action, keys))
+    }
+
+    fn extract_advisory_lock_key_or_placeholders(&self, query: &str) -> (Vec<i64>, Vec<i16>) {
+        use regex::Regex;
+
+        let single_key_regex = Regex::new(r"pg_(?:try_)?advisory_(?:lock|unlock|lock_shared|unlock_shared)\s*\(\s*(\$\d+|-?\d+)\s*\)").ok();
+        let dual_key_regex = Regex::new(r"pg_(?:try_)?advisory_(?:lock|unlock|lock_shared|unlock_shared)\s*\(\s*(\$\d+|-?\d+)\s*,\s*(\$\d+|-?\d+)\s*\)").ok();
+
+        let mut keys = Vec::new();
+        let mut placeholders = Vec::new();
+        let mut has_placeholders = false;
+
+        // Find all single-key advisory lock calls
+        if let Some(regex) = single_key_regex {
+            for caps in regex.captures_iter(query) {
+                if let Some(param_str) = caps.get(1) {
+                    let param = param_str.as_str();
+                    if param.starts_with('$') {
+                        if let Ok(placeholder) = param[1..].parse::<i16>() {
+                            placeholders.push(placeholder);
+                            has_placeholders = true;
+                        }
+                    } else if let Ok(key) = param.parse::<i64>() {
+                        keys.push(key);
+                    }
+                }
+            }
+        }
+
+        // Find all dual-key advisory lock calls
+        if let Some(regex) = dual_key_regex {
+            for caps in regex.captures_iter(query) {
+                if let (Some(param1_str), Some(param2_str)) = (caps.get(1), caps.get(2)) {
+                    let param1 = param1_str.as_str();
+                    let param2 = param2_str.as_str();
+
+                    let placeholder1 = if param1.starts_with('$') {
+                        param1[1..].parse::<i16>().ok()
+                    } else {
+                        None
+                    };
+
+                    let placeholder2 = if param2.starts_with('$') {
+                        param2[1..].parse::<i16>().ok()
+                    } else {
+                        None
+                    };
+
+                    if placeholder1.is_some() && placeholder2.is_some() {
+                        placeholders.extend([placeholder1.unwrap(), placeholder2.unwrap()]);
+                        has_placeholders = true;
+                    } else if let (Ok(k1), Ok(k2)) = (param1.parse::<i32>(), param2.parse::<i32>()) {
+                        let combined_key = ((k1 as i64) << 32) | (k2 as i64 & 0xFFFFFFFF);
+                        keys.push(combined_key);
+                    }
+                }
+            }
+        }
+
+        if has_placeholders {
+            (vec![], placeholders)
+        } else {
+            (keys, vec![])
+        }
+    }
+
+    pub fn process_advisory_lock_bind(&mut self, message: &BytesMut) -> Option<(AdvisoryLockAction, Vec<i64>)> {
+        debug!("process_advisory_lock_bind called, pending_advisory_lock_parse: {:?}", self.pending_advisory_lock_parse);
+        let (action, placeholders) = self.pending_advisory_lock_parse.take()?;
+        debug!("Processing bind for action: {:?}, placeholders: {:?}", action, placeholders);
+
+        let mut cursor = Cursor::new(message);
+        cursor.get_u8();
+        cursor.get_i32();
+
+        let _portal = cursor.read_string().ok()?;
+        let _prepared_statement = cursor.read_string().ok()?;
+
+        let num_param_format_codes = cursor.get_i16();
+        let param_format = if num_param_format_codes == 0 {
+            ParameterFormat::Uniform(Box::new(ParameterFormat::Text))
+        } else if num_param_format_codes == 1 {
+            let format_code = cursor.get_i16();
+            let format = if format_code == 0 {
+                ParameterFormat::Text
+            } else {
+                ParameterFormat::Binary
+            };
+            ParameterFormat::Uniform(Box::new(format))
+        } else {
+            let mut formats = Vec::new();
+            for _ in 0..num_param_format_codes {
+                let format_code = cursor.get_i16();
+                formats.push(if format_code == 0 {
+                    ParameterFormat::Text
+                } else {
+                    ParameterFormat::Binary
+                });
+            }
+            ParameterFormat::Specified(formats)
+        };
+
+        let num_parameters = cursor.get_i16();
+        let mut extracted_values: Vec<i64> = Vec::new();
+
+        for i in 0..num_parameters {
+            let placeholder = i + 1;
+
+            if !placeholders.contains(&placeholder) {
+                let len = cursor.get_i32();
+                if len > 0 {
+                    cursor.advance(len as usize);
+                }
+                continue;
+            }
+
+            let mut len = cursor.get_i32() as usize;
+            let format = match &param_format {
+                ParameterFormat::Text => ParameterFormat::Text,
+                ParameterFormat::Uniform(format) => *format.clone(),
+                ParameterFormat::Specified(formats) => formats[i as usize].clone(),
+                _ => ParameterFormat::Text,
+            };
+
+            let value = match format {
+                ParameterFormat::Text => {
+                    let mut value = String::new();
+                    while len > 0 {
+                        value.push(cursor.get_u8() as char);
+                        len -= 1;
+                    }
+
+                    value.parse::<i64>().ok()?
+                }
+                ParameterFormat::Binary => match len {
+                    2 => cursor.get_i16() as i64,
+                    4 => cursor.get_i32() as i64,
+                    8 => cursor.get_i64(),
+                    _ => {
+                        debug!("Unexpected binary parameter length for advisory lock: {}", len);
+                        return None;
+                    }
+                },
+                _ => return None,
+            };
+
+            extracted_values.push(value);
+        }
+
+        let keys = if extracted_values.len() == 2 && placeholders.len() == 2 {
+            // Dual key advisory lock
+            let k1 = extracted_values[0] as i32;
+            let k2 = extracted_values[1] as i32;
+            vec![((k1 as i64) << 32) | (k2 as i64 & 0xFFFFFFFF)]
+        } else {
+            // Single key advisory locks (possibly multiple)
+            extracted_values
+        };
+
+        let result = (action, keys);
+        // Store the result so it can be retrieved later when we have a server
+        self.pending_advisory_lock_action = Some(result.clone());
+        Some(result)
+    }
+
+    pub fn take_pending_advisory_lock_action(&mut self) -> Option<(AdvisoryLockAction, Vec<i64>)> {
+        self.pending_advisory_lock_action.take()
+    }
+
 }
 
 impl Default for QueryRouter {

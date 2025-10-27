@@ -1007,6 +1007,14 @@ where
                 // to when we get the S message
                 // Parse
                 'P' => {
+                    if self.transaction_mode {
+                        // Detect advisory lock queries to ensure routing to primary
+                        // Even if we can't extract the key yet (due to placeholders),
+                        // we need to set the routing preference
+                        let result = query_router.contains_session_advisory_lock(&message);
+                        debug!("Parse buffering: advisory lock detection result: {:?}", result);
+                    }
+
                     if query_router.query_parser_enabled() {
                         match query_router.parse(&message) {
                             Ok(ast) => {
@@ -1032,6 +1040,15 @@ where
 
                 // Bind
                 'B' => {
+                    if self.transaction_mode {
+                        // Process advisory lock bind to extract key from parameters
+                        if let Some((action, keys)) = query_router.process_advisory_lock_bind(&message) {
+                            debug!("Bind buffering: extracted advisory lock action: {:?}, keys: {:?}", action, keys);
+                            // Store this temporarily - we'll set it on the server once we have one
+                            // For now, just log it. We'll need to retrieve this when we get the server.
+                        }
+                    }
+
                     if query_router.query_parser_enabled() {
                         query_router.infer_shard_from_bind(&message);
                     }
@@ -1134,6 +1151,9 @@ where
                 let address = connection.1;
                 let server = &mut *reference;
 
+                // Validate connection is alive and properly initialized
+                // Pool-level health checks should ensure this, but we double-check for session mode
+                // to catch any connections that became unhealthy between pool checkout and client use
                 if let Err(err) = server.query(";").await {
                     warn!(
                         "Session mode: connection validation failed on checkout from pool, retrying with another connection: {:?}",
@@ -1273,6 +1293,11 @@ where
                 match code {
                     // Query
                     'Q' => {
+                        if let Some((action, keys)) = query_router.contains_session_advisory_lock(&message) {
+                            debug!("Query contains advisory lock operation, setting pending action");
+                            server.set_pending_advisory_lock_action(action, keys);
+                        }
+
                         if query_router.query_parser_enabled() {
                             // We don't want to parse again if we already parsed it as the initial message
                             let ast = match initial_parsed_ast {
@@ -1320,7 +1345,7 @@ where
                         )
                         .await?;
 
-                        if !server.in_transaction() && !server.has_pinned_prepared_statements() {
+                        if !server.in_transaction() && !server.has_pinned_prepared_statements() && !server.has_advisory_lock() {
                             // Report transaction executed statistics.
                             self.stats.transaction();
                             server
@@ -1353,6 +1378,9 @@ where
                     // Parse
                     // The query with placeholders is here, e.g. `SELECT * FROM users WHERE email = $1 AND active = $2`.
                     'P' => {
+                        // Note: advisory lock detection already happened during buffering phase
+                        // to ensure proper routing. Don't call contains_session_advisory_lock again here.
+
                         if query_router.query_parser_enabled() {
                             if let Ok(ast) = query_router.parse(&message) {
                                 if let Ok(output) = query_router.execute_plugins(&ast).await {
@@ -1367,6 +1395,13 @@ where
                     // Bind
                     // The placeholder's replacements are here, e.g. 'user@email.com' and 'true'
                     'B' => {
+                        if let Some((action, keys)) = query_router.process_advisory_lock_bind(&message) {
+                            debug!("Bind contains advisory lock parameters, action: {:?}, keys: {:?}", action, keys);
+                            server.set_pending_advisory_lock_action(action, keys);
+                        } else {
+                            debug!("No advisory lock bind processing result");
+                        }
+
                         self.buffer_bind(message).await?;
                     }
 
@@ -1396,6 +1431,12 @@ where
                     // Frontend (client) is asking for the query result now.
                     'S' => {
                         debug!("Sending query to server");
+
+                        // If we extracted advisory lock info from Bind during buffering, set it on the server now
+                        if let Some((action, keys)) = query_router.take_pending_advisory_lock_action() {
+                            debug!("Setting advisory lock action on server from buffered Bind: {:?}, keys: {:?}", action, keys);
+                            server.set_pending_advisory_lock_action(action, keys);
+                        }
 
                         match plugin_output {
                             Some(PluginOutput::Deny(error)) => {
@@ -1594,7 +1635,7 @@ where
 
                         self.buffer.clear();
 
-                        if !server.in_transaction() && !server.has_pinned_prepared_statements() {
+                        if !server.in_transaction() && !server.has_pinned_prepared_statements() && !server.has_advisory_lock() {
                             self.stats.transaction();
                             server
                                 .stats()
@@ -1654,7 +1695,7 @@ where
                             }
                         };
 
-                        if !server.in_transaction() && !server.has_pinned_prepared_statements() {
+                        if !server.in_transaction() && !server.has_pinned_prepared_statements() && !server.has_advisory_lock() {
                             self.stats.transaction();
                             server
                                 .stats()
@@ -2080,6 +2121,8 @@ where
             let response = self
                 .receive_server_message(server, address, pool, client_stats)
                 .await?;
+
+            server.process_advisory_lock_response(&response);
 
             match write_all_flush(&mut self.write, &response).await {
                 Ok(_) => (),

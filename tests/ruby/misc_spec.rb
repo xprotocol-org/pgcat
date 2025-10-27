@@ -190,7 +190,7 @@ describe "Miscellaneous" do
 
   describe "Checkout failure limit" do
     context "when no checkout failure limit is set" do
-      before do 
+      before do
         new_configs = processes.pgcat.current_config
         new_configs["general"]["connect_timeout"] = 200
         new_configs["pools"]["sharded_db"]["users"]["0"]["pool_size"] = 1
@@ -198,7 +198,7 @@ describe "Miscellaneous" do
         processes.pgcat.reload_config
         sleep 0.5
       end
-  
+
       it "does not disconnect client" do
         Array.new(5) do
           Thread.new do
@@ -218,7 +218,7 @@ describe "Miscellaneous" do
     end
 
     context "when checkout failure limit is set high" do
-      before do 
+      before do
         new_configs = processes.pgcat.current_config
         new_configs["general"]["connect_timeout"] = 200
         new_configs["pools"]["sharded_db"]["users"]["0"]["pool_size"] = 1
@@ -227,7 +227,7 @@ describe "Miscellaneous" do
         processes.pgcat.reload_config
         sleep 0.5
       end
-  
+
       it "does not disconnect client" do
         Array.new(5) do
           Thread.new do
@@ -247,7 +247,7 @@ describe "Miscellaneous" do
     end
 
     context "when checkout failure limit is set low" do
-      before do 
+      before do
         new_configs = processes.pgcat.current_config
         new_configs["general"]["connect_timeout"] = 200
         new_configs["pools"]["sharded_db"]["users"]["0"]["pool_size"] = 1
@@ -256,7 +256,7 @@ describe "Miscellaneous" do
         processes.pgcat.reload_config
         sleep 0.5
       end
-  
+
       it "disconnects client after reaching limit" do
         Array.new(5) do
           Thread.new do
@@ -283,7 +283,7 @@ describe "Miscellaneous" do
       end
     end
   end
-  
+
   describe "Server version reporting" do
     it "reports correct version for normal and admin databases" do
       server_conn = PG::connect(processes.pgcat.connection_string("sharded_db", "sharding_user"))
@@ -515,6 +515,193 @@ describe "Miscellaneous" do
         conn.async_exec("SELECT 1") # should be able to send another query
         conn.close
       end
+    end
+  end
+
+  describe "Advisory locks" do
+    shared_examples "advisory lock support" do |mode|
+      it "allows acquiring, using, and releasing advisory locks" do
+        conn = PG::connect(processes.pgcat.connection_string("sharded_db", "sharding_user"))
+
+        lock_id = 123456
+        result = conn.async_exec("SELECT pg_advisory_lock($1)", [lock_id])
+        expect(result.ntuples).to eq(1)
+
+        result = conn.async_exec("SELECT 1 + 1 as sum")
+        expect(result[0]["sum"]).to eq("2")
+
+        result = conn.async_exec("SELECT COUNT(*) as count FROM pg_catalog.pg_tables WHERE schemaname = 'public'")
+        expect(result[0]["count"].to_i).to be >= 0
+
+        result = conn.async_exec("SELECT pg_advisory_unlock($1)", [lock_id])
+        expect(result[0]["pg_advisory_unlock"]).to eq("t")
+
+        conn.close
+      end
+
+      it "handles multiple advisory locks correctly" do
+        conn = PG::connect(processes.pgcat.connection_string("sharded_db", "sharding_user"))
+
+        lock_id_1 = 111111
+        lock_id_2 = 222222
+
+        result = conn.async_exec("SELECT pg_advisory_lock($1)", [lock_id_1])
+        expect(result.ntuples).to eq(1)
+
+        result = conn.async_exec("SELECT pg_advisory_lock($1)", [lock_id_2])
+        expect(result.ntuples).to eq(1)
+
+        result = conn.async_exec("SELECT 'test' as value")
+        expect(result[0]["value"]).to eq("test")
+
+        result = conn.async_exec("SELECT pg_advisory_unlock($1)", [lock_id_1])
+        expect(result[0]["pg_advisory_unlock"]).to eq("t")
+
+        result = conn.async_exec("SELECT pg_advisory_unlock($1)", [lock_id_2])
+        expect(result[0]["pg_advisory_unlock"]).to eq("t")
+
+        conn.close
+      end
+
+      it "handles multiple advisory locks in a single query" do
+        conn = PG::connect(processes.pgcat.connection_string("sharded_db", "sharding_user"))
+
+        lock_id_1 = 333333
+        lock_id_2 = 444444
+
+        # Execute multiple advisory locks in a single query
+        result = conn.async_exec("SELECT pg_advisory_lock($1), pg_advisory_lock($2)", [lock_id_1, lock_id_2])
+        expect(result.ntuples).to eq(1)
+
+        # In session mode, verify that locks persist across connections
+        # In transaction mode, just verify the query executed
+        if mode == "session"
+          # Verify that both locks are held by trying to acquire them from another connection
+          conn2 = PG::connect(processes.pgcat.connection_string("sharded_db", "sharding_user"))
+
+          # Try to acquire the locks from the second connection - should fail
+          result2 = conn2.async_exec("SELECT pg_try_advisory_lock($1) as try1, pg_try_advisory_lock($2) as try2", [lock_id_1, lock_id_2])
+          expect(result2[0]["try1"]).to eq("f")  # Should fail to acquire first lock
+          expect(result2[0]["try2"]).to eq("f")  # Should fail to acquire second lock
+
+          conn2.close
+
+          # Unlock both locks in a single query
+          result = conn.async_exec("SELECT pg_advisory_unlock($1), pg_advisory_unlock($2)", [lock_id_1, lock_id_2])
+          expect(result.ntuples).to eq(1)
+
+          # Verify that both locks are now free
+          conn3 = PG::connect(processes.pgcat.connection_string("sharded_db", "sharding_user"))
+
+          result3 = conn3.async_exec("SELECT pg_try_advisory_lock($1) as try1, pg_try_advisory_lock($2) as try2", [lock_id_1, lock_id_2])
+          expect(result3[0]["try1"]).to eq("t")  # Should succeed now
+          expect(result3[0]["try2"]).to eq("t")  # Should succeed now
+
+          # Clean up
+          conn3.async_exec("SELECT pg_advisory_unlock($1), pg_advisory_unlock($2)", [lock_id_1, lock_id_2])
+
+          conn3.close
+        end
+
+        conn.close
+      end
+
+      it "handles multiple advisory locks with different keys in a single query" do
+        conn = PG::connect(processes.pgcat.connection_string("sharded_db", "sharding_user"))
+
+        # Test multiple different lock operations in one query
+        result = conn.async_exec("SELECT pg_advisory_lock(555555), pg_advisory_lock(666666)")
+        expect(result.ntuples).to eq(1)
+
+        # Test that we can unlock them in a single query too
+        result = conn.async_exec("SELECT pg_advisory_unlock(555555), pg_advisory_unlock(666666)")
+        expect(result.ntuples).to eq(1)
+
+        conn.close
+      end
+
+      it "works with transaction-level advisory locks" do
+        conn = PG::connect(processes.pgcat.connection_string("sharded_db", "sharding_user"))
+
+        lock_id = 789012
+
+        conn.async_exec("BEGIN")
+
+        result = conn.async_exec("SELECT pg_advisory_xact_lock($1)", [lock_id])
+        expect(result.ntuples).to eq(1)
+
+        result = conn.async_exec("SELECT current_timestamp")
+        expect(result.ntuples).to eq(1)
+
+        conn.async_exec("COMMIT")
+
+        conn.close
+      end
+
+      it "handles try_advisory_lock correctly" do
+        conn1 = PG::connect(processes.pgcat.connection_string("sharded_db", "sharding_user"))
+        conn2 = PG::connect(processes.pgcat.connection_string("sharded_db", "sharding_user"))
+
+        lock_id = 555555
+
+        result = conn1.async_exec("SELECT pg_try_advisory_lock($1)", [lock_id])
+        expect(result[0]["pg_try_advisory_lock"]).to eq("t")
+
+        result = conn2.async_exec("SELECT pg_try_advisory_lock($1)", [lock_id])
+        expect(result[0]["pg_try_advisory_lock"]).to eq("f")
+
+        result = conn1.async_exec("SELECT 42 as answer")
+        expect(result[0]["answer"]).to eq("42")
+
+        result = conn1.async_exec("SELECT pg_advisory_unlock($1)", [lock_id])
+        expect(result[0]["pg_advisory_unlock"]).to eq("t")
+
+        result = conn2.async_exec("SELECT pg_try_advisory_lock($1)", [lock_id])
+        expect(result[0]["pg_try_advisory_lock"]).to eq("t")
+
+        result = conn2.async_exec("SELECT pg_advisory_unlock($1)", [lock_id])
+        expect(result[0]["pg_advisory_unlock"]).to eq("t")
+
+        conn1.close
+        conn2.close
+      end
+
+      if mode == "transaction"
+        it "cleans up session-scoped advisory locks when connection returns to pool" do
+          conn1 = PG::connect(processes.pgcat.connection_string("sharded_db", "sharding_user"))
+          conn2 = PG::connect(processes.pgcat.connection_string("sharded_db", "sharding_user"))
+
+          lock_id = 999999
+
+          result = conn1.async_exec("SELECT pg_advisory_lock($1)", [lock_id])
+          expect(result.ntuples).to eq(1)
+
+          result = conn1.async_exec("SELECT 1 + 1 as sum")
+          expect(result[0]["sum"]).to eq("2")
+
+          conn1.close
+
+          sleep(0.5)
+
+          result = conn2.async_exec("SELECT pg_try_advisory_lock($1)", [lock_id])
+          expect(result[0]["pg_try_advisory_lock"]).to eq("t")
+
+          result = conn2.async_exec("SELECT pg_advisory_unlock($1)", [lock_id])
+          expect(result[0]["pg_advisory_unlock"]).to eq("t")
+
+          conn2.close
+        end
+      end
+    end
+
+    context "in session mode" do
+      let(:processes) { Helpers::Pgcat.single_instance_setup("sharded_db", 5, "session") }
+      include_examples "advisory lock support", "session"
+    end
+
+    context "in transaction mode" do
+      let(:processes) { Helpers::Pgcat.single_instance_setup("sharded_db", 5, "transaction") }
+      include_examples "advisory lock support", "transaction"
     end
   end
 end

@@ -288,6 +288,12 @@ pub struct Server {
     /// These statements belong to the current client and require connection pinning
     pinned_prepared_statements: std::collections::HashSet<String>,
 
+    /// Map of advisory lock keys and their reference counts currently held by this connection.
+    advisory_lock_keys: std::collections::HashMap<i64, u32>,
+
+    /// Pending advisory lock action awaiting server response.
+    pending_advisory_lock_action: Option<(crate::query_router::AdvisoryLockAction, Vec<i64>)>,
+
     /// Is there more data for the client to read.
     data_available: bool,
 
@@ -808,6 +814,8 @@ impl Server {
                         secret_key,
                         in_transaction: false,
                         pinned_prepared_statements: std::collections::HashSet::new(),
+                        advisory_lock_keys: std::collections::HashMap::new(),
+                        pending_advisory_lock_action: None,
                         in_copy_mode: false,
                         data_available: false,
                         bad: false,
@@ -1261,6 +1269,107 @@ impl Server {
         self.pinned_prepared_statements.remove(name);
     }
 
+    pub fn has_advisory_lock(&self) -> bool {
+        !self.advisory_lock_keys.is_empty()
+    }
+
+    pub fn set_pending_advisory_lock_action(
+        &mut self,
+        action: crate::query_router::AdvisoryLockAction,
+        keys: Vec<i64>,
+    ) {
+        // Track advisory locks immediately when the action is set, not when response is processed
+        match action {
+            crate::query_router::AdvisoryLockAction::Lock => {
+                for key in &keys {
+                    debug!("Session-scoped advisory lock requested for key: {}", key);
+                    let count = self.advisory_lock_keys.entry(*key).or_insert(0);
+                    *count += 1;
+                }
+                debug!("Advisory lock keys after lock: {:?}", self.advisory_lock_keys);
+            }
+            crate::query_router::AdvisoryLockAction::TryLock => {
+                // For try locks, we'll update based on response since we need to know if it succeeded
+                self.pending_advisory_lock_action = Some((action, keys));
+                return;
+            }
+            crate::query_router::AdvisoryLockAction::Unlock => {
+                for key in &keys {
+                    debug!("Advisory lock release requested for key: {}", key);
+                    if let Some(count) = self.advisory_lock_keys.get_mut(key) {
+                        *count -= 1;
+                        if *count == 0 {
+                            self.advisory_lock_keys.remove(key);
+                        }
+                    }
+                }
+                debug!("Advisory lock keys after unlock: {:?}", self.advisory_lock_keys);
+            }
+            crate::query_router::AdvisoryLockAction::UnlockAll => {
+                debug!("All advisory locks release requested");
+                self.advisory_lock_keys.clear();
+            }
+        }
+
+        self.pending_advisory_lock_action = Some((action, keys));
+    }
+
+    pub fn process_advisory_lock_response(&mut self, response: &BytesMut) {
+        use crate::query_router::AdvisoryLockAction;
+
+        // Only process responses for operations that need response validation
+        // (currently only pg_try_advisory_lock)
+        if let Some((AdvisoryLockAction::TryLock, keys)) = &self.pending_advisory_lock_action {
+            debug!("Processing advisory lock response for try lock, keys: {:?}", keys);
+
+            let mut cursor = std::io::Cursor::new(response);
+            use bytes::Buf;
+
+            while cursor.has_remaining() {
+                if cursor.remaining() < 5 {
+                    break;
+                }
+
+                let code = cursor.get_u8() as char;
+                let len = cursor.get_i32() as usize;
+
+                if code == 'D' && len >= 4 {
+                    let remaining_in_msg = len - 4;
+                    if cursor.remaining() < remaining_in_msg {
+                        break;
+                    }
+
+                    let data_start = cursor.position() as usize;
+                    let data_end = data_start + remaining_in_msg;
+                    let data_row = &response[data_start..data_end];
+
+                    let has_true_value = data_row.windows(2).any(|w| w == b"\x00t" || w == [0x01, b't']);
+
+                    if has_true_value {
+                        // pg_try_advisory_lock returned true, so the lock was acquired
+                        for key in keys {
+                            debug!("Session-scoped advisory lock acquired for key: {}", key);
+                            let count = self.advisory_lock_keys.entry(*key).or_insert(0);
+                            *count += 1;
+                        }
+                        debug!("Advisory lock keys after try lock success: {:?}", self.advisory_lock_keys);
+                    } else {
+                        debug!("pg_try_advisory_lock returned false, lock not acquired");
+                    }
+
+                    break;
+                } else if len >= 4 && cursor.remaining() >= len - 4 {
+                    cursor.advance(len - 4);
+                } else {
+                    break;
+                }
+            }
+        }
+
+        // Clear the pending action after processing
+        self.pending_advisory_lock_action = None;
+    }
+
     /// Currently copying data from client to server or vice-versa.
     pub fn in_copy_mode(&self) -> bool {
         self.in_copy_mode
@@ -1376,6 +1485,12 @@ impl Server {
             warn!(target: "pgcat::server::cleanup", "Server returned with pinned prepared statements, deallocating all");
             self.query("DEALLOCATE ALL").await?;
             self.pinned_prepared_statements.clear();
+        }
+
+        if self.has_advisory_lock() {
+            warn!(target: "pgcat::server::cleanup", "Server returned with advisory locks held, releasing all locks");
+            self.query("SELECT pg_advisory_unlock_all()").await?;
+            self.advisory_lock_keys.clear();
         }
 
         // Client disconnected but it performed session-altering operations such as
