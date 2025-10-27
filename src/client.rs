@@ -1344,7 +1344,7 @@ where
                         )
                         .await?;
 
-                        if !server.in_transaction() && !server.has_advisory_lock() {
+                        if !server.in_transaction() && !server.has_advisory_lock() && !server.has_pinned_prepared_statements() {
                             // Report transaction executed statistics.
                             self.stats.transaction();
                             server
@@ -1495,10 +1495,18 @@ where
                                             let first_char_in_name = *data.get(5).unwrap_or(&0);
                                             if first_char_in_name != 0 {
                                                 // This is a named prepared statement while prepared statements are disabled
-                                                // Server connection state will need to be cleared at checkin
-                                                server.mark_dirty();
+                                                if pool.prepared_statement_cache.is_none() {
+                                                    // Cache size is 0, track on server for connection pinning
+                                                    if let Ok(statement_name) = Parse::get_name(&data) {
+                                                        debug!("Tracking pinned prepared statement: {}", statement_name);
+                                                        server.track_pinned_prepared_statement(statement_name);
+                                                    }
+                                                } else {
+                                                    // Cache size > 0, mark dirty for cleanup
+                                                    server.mark_dirty();
+                                                }
                                             }
-                                            // Not a prepared statement
+                                            // Not a prepared statement or anonymous
                                             self.buffer.put(&data[..]);
                                             continue;
                                         }
@@ -1574,6 +1582,11 @@ where
                                         // Queue up a close complete message to send to the client
                                         self.response_message_queue_buffer.put(close_complete());
                                     } else {
+                                        // Remove from pinned tracking if cache_size=0
+                                        if pool.prepared_statement_cache.is_none() && close.is_prepared_statement() && !close.anonymous() {
+                                            debug!("Removing pinned prepared statement: {}", close.name);
+                                            server.remove_pinned_prepared_statement(&close.name);
+                                        }
                                         self.buffer.put(&data[..]);
                                     }
                                 }
@@ -1625,7 +1638,7 @@ where
 
                         self.buffer.clear();
 
-                        if !server.in_transaction() && !server.has_advisory_lock() {
+                        if !server.in_transaction() && !server.has_advisory_lock() && !server.has_pinned_prepared_statements() {
                             self.stats.transaction();
                             server
                                 .stats()
@@ -1685,7 +1698,7 @@ where
                             }
                         };
 
-                        if !server.in_transaction() && !server.has_advisory_lock() {
+                        if !server.in_transaction() && !server.has_advisory_lock() && !server.has_pinned_prepared_statements() {
                             self.stats.transaction();
                             server
                                 .stats()

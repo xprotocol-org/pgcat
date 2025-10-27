@@ -291,6 +291,10 @@ pub struct Server {
     /// Pending advisory lock action awaiting server response.
     pending_advisory_lock_action: Option<(crate::query_router::AdvisoryLockAction, Option<i64>)>,
 
+    /// Set of prepared statement names that pin the connection when cache_size=0
+    /// These statements belong to the current client and require connection pinning
+    pinned_prepared_statements: std::collections::HashSet<String>,
+
     /// Is there more data for the client to read.
     data_available: bool,
 
@@ -812,6 +816,7 @@ impl Server {
                         in_transaction: false,
                         advisory_lock_keys: std::collections::HashSet::new(),
                         pending_advisory_lock_action: None,
+                        pinned_prepared_statements: std::collections::HashSet::new(),
                         in_copy_mode: false,
                         data_available: false,
                         bad: false,
@@ -1257,6 +1262,18 @@ impl Server {
         !self.advisory_lock_keys.is_empty()
     }
 
+    pub fn has_pinned_prepared_statements(&self) -> bool {
+        !self.pinned_prepared_statements.is_empty()
+    }
+
+    pub fn track_pinned_prepared_statement(&mut self, name: String) {
+        self.pinned_prepared_statements.insert(name);
+    }
+
+    pub fn remove_pinned_prepared_statement(&mut self, name: &str) {
+        self.pinned_prepared_statements.remove(name);
+    }
+
     pub fn set_pending_advisory_lock_action(
         &mut self,
         action: crate::query_router::AdvisoryLockAction,
@@ -1456,6 +1473,12 @@ impl Server {
             warn!(target: "pgcat::server::cleanup", "Server returned with advisory locks held, releasing all locks");
             self.query("SELECT pg_advisory_unlock_all()").await?;
             self.advisory_lock_keys.clear();
+        }
+
+        if self.has_pinned_prepared_statements() {
+            warn!(target: "pgcat::server::cleanup", "Server returned with pinned prepared statements, deallocating all");
+            self.query("DEALLOCATE ALL").await?;
+            self.pinned_prepared_statements.clear();
         }
 
         // Client disconnected but it performed session-altering operations such as

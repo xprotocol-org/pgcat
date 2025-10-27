@@ -12,7 +12,7 @@ show_help() {
 
     echo "==================================="
     echo "Interactive test environment ready"
-    echo "To run integration tests, you can use the following commands:"
+    echo "To run specific integration tests, you can use the following commands:"
     echo -e "   ${BLUE}Ruby:   ${RED}cd /app/tests/ruby && bundle exec ruby tests.rb --format documentation${RESET}"
     echo -e "   ${BLUE}Ruby:   ${RED}cd /app/tests/ruby && bundle exec rspec *_spec.rb --format documentation${RESET}"
     echo -e "   ${BLUE}Python: ${RED}cd /app/ && pytest${RESET}"
@@ -21,6 +21,8 @@ show_help() {
     echo "the source code for tests are directly linked to the source code in the container so you can modify the code and run the tests again"
     echo "You can rebuild PgCat from within the container by running"
     echo -e "  ${GREEN}cargo build${RESET}"
+    echo "You can also run all the integration tests by running"
+    echo -e "  ${GREEN}INTERACTIVE_TEST_ENVIRONMENT="" bash /app/tests/docker/run.sh${RESET}"
     echo "and then run the tests again"
     echo "==================================="
 }
