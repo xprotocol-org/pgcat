@@ -284,6 +284,9 @@ pub struct Server {
 
     /// Is the server inside a transaction or idle.
     in_transaction: bool,
+    /// Set of prepared statement names that pin the connection when cache_size=0
+    /// These statements belong to the current client and require connection pinning
+    pinned_prepared_statements: std::collections::HashSet<String>,
 
     /// Is there more data for the client to read.
     data_available: bool,
@@ -804,6 +807,7 @@ impl Server {
                         process_id,
                         secret_key,
                         in_transaction: false,
+                        pinned_prepared_statements: std::collections::HashSet::new(),
                         in_copy_mode: false,
                         data_available: false,
                         bad: false,
@@ -1245,6 +1249,18 @@ impl Server {
         self.in_transaction
     }
 
+    pub fn has_pinned_prepared_statements(&self) -> bool {
+        !self.pinned_prepared_statements.is_empty()
+    }
+
+    pub fn track_pinned_prepared_statement(&mut self, name: String) {
+        self.pinned_prepared_statements.insert(name);
+    }
+
+    pub fn remove_pinned_prepared_statement(&mut self, name: &str) {
+        self.pinned_prepared_statements.remove(name);
+    }
+
     /// Currently copying data from client to server or vice-versa.
     pub fn in_copy_mode(&self) -> bool {
         self.in_copy_mode
@@ -1354,6 +1370,12 @@ impl Server {
         if self.in_transaction() {
             warn!(target: "pgcat::server::cleanup", "Server returned while still in transaction, rolling back transaction");
             self.query("ROLLBACK").await?;
+        }
+
+        if self.has_pinned_prepared_statements() {
+            warn!(target: "pgcat::server::cleanup", "Server returned with pinned prepared statements, deallocating all");
+            self.query("DEALLOCATE ALL").await?;
+            self.pinned_prepared_statements.clear();
         }
 
         // Client disconnected but it performed session-altering operations such as
