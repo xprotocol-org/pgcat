@@ -1554,12 +1554,23 @@ pub async fn get_or_create_pool(
     user: &str,
     client_server_map: ClientServerMap,
 ) -> Result<Option<ConnectionPool>, Error> {
+    // Check if pool already exists (fast path without lock)
     if let Some(pool) = get_pool(db, user) {
         return Ok(Some(pool));
     }
 
     if !has_default_pool() {
         return Ok(None);
+    }
+
+    // Acquire lock for double-check
+    {
+        let _guard = POOLS_WRITE_LOCK.lock();
+
+        // Double-check inside the lock in case another thread created it
+        if let Some(pool) = get_pool(db, user) {
+            return Ok(Some(pool));
+        }
     }
 
     info!(
@@ -1569,7 +1580,18 @@ pub async fn get_or_create_pool(
 
     let pool = ConnectionPool::create_dynamic_pool(db, user, &[], client_server_map).await?;
 
-    add_dynamic_pool(db, user, pool.clone());
+    // Final check and add - use block to limit lock scope
+    {
+        let _guard = POOLS_WRITE_LOCK.lock();
+
+        // Check again - another thread might have created it while we were creating
+        if let Some(existing_pool) = get_pool(db, user) {
+            return Ok(Some(existing_pool));
+        }
+
+        // Insert the pool directly since we already hold the lock
+        add_dynamic_pool(db, user, pool.clone());
+    }
 
     Ok(Some(pool))
 }
@@ -1582,7 +1604,6 @@ fn has_default_pool() -> bool {
 
 /// Add a dynamic pool to the pool map
 fn add_dynamic_pool(db: &str, user: &str, pool: ConnectionPool) {
-    let _guard = POOLS_WRITE_LOCK.lock();
     let mut pools = (*(*POOLS.load())).clone();
     pools.insert(PoolIdentifier::new(db, user), pool);
     POOLS.store(Arc::new(pools));
