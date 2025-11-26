@@ -861,8 +861,6 @@ where
         // e.g. primary, replica, which shard.
         let mut query_router = QueryRouter::new();
 
-        let mut checkout_failure_count: u64 = 0;
-
         self.stats.register(self.stats.clone());
 
         // Result returned by one of the plugins.
@@ -1102,9 +1100,29 @@ where
                 self.stats.waiting();
             }
 
-            let checkout_limit = pool.settings.checkout_failure_limit.unwrap_or(u64::MAX);
+            let checkout_limit = pool.settings.checkout_failure_limit.unwrap_or(5);
+            debug!("Checkout limit: {}", checkout_limit);
 
+            let mut checkout_failure_count = 0;
             let (mut reference, address) = loop {
+                if checkout_failure_count >= checkout_limit {
+                    error!(
+                        "Checkout failure limit reached ({} / {}) - disconnecting client",
+                        checkout_failure_count, checkout_limit
+                    );
+                    self.stats.idle();
+                    error_response_terminal(
+                        &mut self.write,
+                        &format!(
+                            "checkout failure limit reached ({} / {})",
+                            checkout_failure_count, checkout_limit
+                        ),
+                    )
+                    .await?;
+                    self.stats.disconnect();
+                    return Ok(());
+                }
+
                 let connection = match pool
                     .get(query_router.shard(), query_router.role(), &self.stats)
                     .await
@@ -1121,12 +1139,6 @@ where
                             self.reset_buffered_state();
                         }
 
-                        error_response(
-                            &mut self.write,
-                            format!("could not get connection from the pool - {}", err).as_str(),
-                        )
-                        .await?;
-
                         error!(
                             "Could not get connection from pool: \
                             {{ \
@@ -1142,7 +1154,10 @@ where
                             query_router.role(),
                             err
                         );
+
                         checkout_failure_count += 1;
+                        debug!("Checkout failure count: {} / {}", checkout_failure_count, checkout_limit);
+                        
                         continue;
                     }
                 };
@@ -1165,26 +1180,27 @@ where
 
                     drop(reference);
 
-                    checkout_failure_count += 1;
-                    continue;
-                }
+                        checkout_failure_count += 1;
 
-                if checkout_failure_count >= checkout_limit {
-                    error!(
-                        "Checkout failure limit reached ({} / {}) - disconnecting client",
-                        checkout_failure_count, checkout_limit
-                    );
-                    self.stats.idle();
-                    error_response_terminal(
-                        &mut self.write,
-                        &format!(
-                            "checkout failure limit reached ({} / {})",
-                            checkout_failure_count, checkout_limit
-                        ),
-                    )
-                    .await?;
-                    self.stats.disconnect();
-                    return Ok(());
+                        if checkout_limit > 0 && checkout_failure_count >= checkout_limit {
+                            error!(
+                                "Checkout failure limit reached ({} / {}) - disconnecting client",
+                                checkout_failure_count, checkout_limit
+                            );
+                            self.stats.idle();
+                            error_response_terminal(
+                                &mut self.write,
+                                &format!(
+                                    "checkout failure limit reached ({} / {})",
+                                    checkout_failure_count, checkout_limit
+                                ),
+                            )
+                            .await?;
+                            self.stats.disconnect();
+                            return Ok(());
+                        }
+
+                        continue;
                 }
 
                 debug!("Connection validated on checkout");
@@ -1298,6 +1314,16 @@ where
                             server.set_pending_advisory_lock_action(action, keys);
                         }
 
+                        if let Some(name) = query_router.get_deallocate_info(&message) {
+                            debug!("Intercepted DEALLOCATE {}", name);
+                            if name.to_uppercase() == "ALL" {
+                                self.prepared_statements.clear();
+                                server.clear_prepared_statements_cache();
+                            } else {
+                                self.prepared_statements.remove(&name);
+                            }
+                        }
+
                         if query_router.query_parser_enabled() {
                             // We don't want to parse again if we already parsed it as the initial message
                             let ast = match initial_parsed_ast {
@@ -1335,7 +1361,7 @@ where
 
                         debug!("Sending query to server");
 
-                        self.send_and_receive_loop(
+                        match self.send_and_receive_loop(
                             code,
                             Some(&message),
                             server,
@@ -1343,7 +1369,51 @@ where
                             &pool,
                             &self.stats.clone(),
                         )
-                        .await?;
+                        .await
+                        {
+                            Ok(_) => {
+                                // Query executed successfully
+                            }
+                            Err(err) => {
+                                // Query execution failed - send error to client but keep connection alive
+                                // This makes pgcat transparent: clients only see errors, not disconnections
+                                warn!(
+                                    "Query execution failed, sending error to client but keeping connection alive: {:?}",
+                                    err
+                                );
+
+                                // Only mark server as bad for connection/network errors, not query errors
+                                match &err {
+                                    Error::SocketError(_) | Error::ServerError => {
+                                        debug!("Connection error detected, marking server as bad");
+                                        server.mark_bad(&format!("connection error during query execution: {}", err));
+                                    }
+                                    _ => {
+                                        // Query-level errors (BadQuery, StatementTimeout, etc.) don't indicate a bad server
+                                        debug!("Query-level error, not marking server as bad: {:?}", err);
+                                    }
+                                }
+
+                                // Send error response to client
+                                if let Err(write_err) = error_response(
+                                    &mut self.write,
+                                    &format!("query execution failed: {}", err),
+                                )
+                                .await
+                                {
+                                    // If we can't write to client, disconnect
+                                    error!("Failed to send error response to client: {:?}", write_err);
+                                    self.stats.disconnect();
+                                    return Err(write_err);
+                                }
+
+                                // Mark client as idle and release server back to pool
+                                self.stats.idle();
+
+                                // Break to release server back to pool - client will get a new one on next query
+                                break;
+                            }
+                        }
 
                         if !server.in_transaction() && !server.has_pinned_prepared_statements() && !server.has_advisory_lock() {
                             // Report transaction executed statistics.

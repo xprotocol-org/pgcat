@@ -155,6 +155,7 @@ describe "Stats" do
         new_configs["general"]["connect_timeout"] = 500
         new_configs["general"]["ban_time"] = 1
         new_configs["general"]["shutdown_timeout"] = 1
+        new_configs["pools"]["sharded_db"]["checkout_failure_limit"] = 100
         new_configs["pools"]["sharded_db"]["users"]["0"]["pool_size"] = 1
         processes.pgcat.update_config(new_configs)
         processes.pgcat.reload_config
@@ -165,7 +166,7 @@ describe "Stats" do
           threads << Thread.new { c.async_exec("SELECT pg_sleep(1)") rescue PG::SystemError }
         end
 
-        sleep(2)
+        sleep(15)
         admin_conn = PG::connect(processes.pgcat.admin_connection_string)
         results = admin_conn.async_exec("SHOW POOLS")[0]
         %w[cl_active cl_waiting cl_cancel_req sv_active sv_used sv_tested sv_login maxwait].each do |s|

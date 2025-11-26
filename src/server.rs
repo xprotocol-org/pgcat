@@ -1201,6 +1201,13 @@ impl Server {
         cache.pop(name);
     }
 
+    pub fn clear_prepared_statements_cache(&mut self) {
+        if let Some(cache) = &mut self.prepared_statement_cache {
+            cache.clear();
+        }
+        self.pinned_prepared_statements.clear();
+    }
+
     pub async fn register_prepared_statement(
         &mut self,
         parse: &Parse,

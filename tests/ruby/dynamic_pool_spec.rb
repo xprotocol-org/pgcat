@@ -9,12 +9,14 @@ describe "Dynamic Pool Creation" do
     processes.pgcat.shutdown
   end
 
-  context "when default pool is configured" do
+  shared_examples "dynamic pool basics" do |pool_mode|
+    context "when default pool is configured" do
     it "creates dynamic pool for new database" do
       current_configs = processes.pgcat.current_config
 
       default_pool_config = current_configs["pools"]["simple_db"].clone
       default_pool_config["shards"]["0"]["database"] = "postgres"
+      default_pool_config["pool_mode"] = pool_mode
 
       default_pool_config["users"]["1"] = {
         "username" => "simple_user",
@@ -71,6 +73,7 @@ describe "Dynamic Pool Creation" do
 
       default_pool_config = current_configs["pools"]["simple_db"].clone
       default_pool_config["shards"]["0"]["database"] = "postgres"
+      default_pool_config["pool_mode"] = pool_mode
 
       default_pool_config["users"]["1"] = {
         "username" => "simple_user",
@@ -128,6 +131,7 @@ describe "Dynamic Pool Creation" do
 
       default_pool_config = current_configs["pools"]["simple_db"].clone
       default_pool_config["shards"]["0"]["database"] = "postgres"
+      default_pool_config["pool_mode"] = pool_mode
 
       default_pool_config["users"]["1"] = {
         "username" => "simple_user",
@@ -184,6 +188,7 @@ describe "Dynamic Pool Creation" do
 
       default_pool_config = current_configs["pools"]["simple_db"].clone
       default_pool_config["shards"]["0"]["database"] = "postgres"
+      default_pool_config["pool_mode"] = pool_mode
 
       default_pool_config["users"]["1"] = {
         "username" => "simple_user",
@@ -245,6 +250,7 @@ describe "Dynamic Pool Creation" do
 
       default_pool_config = current_configs["pools"]["simple_db"].clone
       default_pool_config["shards"]["0"]["database"] = "postgres"
+      default_pool_config["pool_mode"] = pool_mode
       current_configs["pools"]["default"] = default_pool_config
 
       processes.pgcat.update_config(current_configs)
@@ -286,6 +292,7 @@ describe "Dynamic Pool Creation" do
 
       default_pool_config = current_configs["pools"]["simple_db"].clone
       default_pool_config["shards"]["0"]["database"] = "postgres"
+      default_pool_config["pool_mode"] = pool_mode
       default_pool_config["users"] = {
         "0" => {
           "username" => "different_user",
@@ -311,6 +318,15 @@ describe "Dynamic Pool Creation" do
         )
       end.to raise_error(PG::ConnectionBad)
     end
+    end
+  end
+
+  context "in transaction mode" do
+    include_examples "dynamic pool basics", "transaction"
+  end
+
+  context "in session mode" do
+    include_examples "dynamic pool basics", "session"
   end
 
   shared_examples "handles pg_terminate_backend gracefully" do |pool_mode|
@@ -718,7 +734,7 @@ describe "Dynamic Pool Creation" do
           dbname: "postgres"
         )
         admin_pgcat_conn.async_exec("CREATE DATABASE #{test_db}")
-        admin_pgcat_conn.close
+
 
         conn1 = PG.connect(
           host: processes.pgcat.host,
@@ -731,13 +747,7 @@ describe "Dynamic Pool Creation" do
         conn1.async_exec("INSERT INTO test_data (value) VALUES ('initial')")
         conn1.close
 
-        admin_pgcat_conn = PG.connect(
-          host: processes.pgcat.host,
-          port: processes.pgcat.port,
-          user: "postgres",
-          password: "postgres",
-          dbname: "postgres"
-        )
+
         result = admin_pgcat_conn.async_exec("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '#{test_db}' AND pid <> pg_backend_pid()")
         terminated_count = result.ntuples
         puts "Terminated #{terminated_count} backend(s) for database #{test_db}"

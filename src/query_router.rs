@@ -78,6 +78,7 @@ static CUSTOM_SQL_REGEX_SET: OnceCell<RegexSet> = OnceCell::new();
 static CUSTOM_SQL_REGEX_LIST: OnceCell<Vec<Regex>> = OnceCell::new();
 
 static ADVISORY_LOCK_REGEX: OnceCell<Regex> = OnceCell::new();
+static DEALLOCATE_REGEX: OnceCell<Regex> = OnceCell::new();
 
 #[derive(Debug, Clone, PartialEq)]
 enum DatabaseActivityState {
@@ -165,7 +166,49 @@ impl QueryRouter {
             return false;
         }
 
+        let deallocate_regex = match Regex::new(
+            r"(?i)^DEALLOCATE\s+(?:PREPARE\s+)?(ALL|[\w_]+)\s*;?$",
+        ) {
+            Ok(rgx) => rgx,
+            Err(err) => {
+                error!(
+                    "QueryRouter::setup Could not compile deallocate regex: {:?}",
+                    err
+                );
+                return false;
+            }
+        };
+
+        if DEALLOCATE_REGEX.set(deallocate_regex).is_err() {
+            return false;
+        }
+
         CUSTOM_SQL_REGEX_SET.set(set).is_ok()
+    }
+
+    /// Check if the query is a DEALLOCATE statement and return the name or "ALL"
+    pub fn get_deallocate_info(&self, message: &BytesMut) -> Option<String> {
+        let deallocate_regex = DEALLOCATE_REGEX.get()?;
+
+        let mut message_cursor = Cursor::new(message);
+        let code = message_cursor.get_u8() as char;
+        let _len = message_cursor.get_i32();
+
+        let query = match code {
+            'Q' => {
+                let query = message_cursor.read_string().ok()?;
+                query
+            }
+            _ => return None,
+        };
+
+        if let Some(captures) = deallocate_regex.captures(&query) {
+            if let Some(name) = captures.get(1) {
+                return Some(name.as_str().to_string());
+            }
+        }
+
+        None
     }
 
     /// Create a new instance of the query router.

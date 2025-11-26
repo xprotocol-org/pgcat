@@ -438,6 +438,7 @@ func testTemplateDatabaseWithTerminate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to connect to template database: %+v", err)
 	}
+	defer templateSQLDB.Close()
 
 	t.Log("Running migrations on template database with prepared statements enabled")
 	err = templateGormDB.WithContext(ctx).Exec(
@@ -472,8 +473,8 @@ func testTemplateDatabaseWithTerminate(t *testing.T) {
 	}
 	t.Logf("Template database has %d row(s)", count)
 
-	t.Log("Closing template database connections")
-	templateSQLDB.Close()
+	t.Log("Keeping template database connections open to test pg_terminate_backend")
+	// templateSQLDB.Close() - intentionally left open to be killed by pg_terminate_backend
 
 	t.Logf("Immediately calling pg_terminate_backend")
 	err = postgresGormDB.WithContext(ctx).Exec(fmt.Sprintf(

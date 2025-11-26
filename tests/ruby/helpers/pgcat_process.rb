@@ -16,8 +16,11 @@ class PgcatProcess
       Process.wait(pid)
     end
 
-    File.delete(config_filename) if File.exist?(config_filename)
-    File.delete(log_filename) if File.exist?(log_filename)
+    # Only delete files if PGCAT_KEEP_LOGS is not set
+    unless ENV['PGCAT_KEEP_LOGS']
+      File.delete(config_filename) if File.exist?(config_filename)
+      File.delete(log_filename) if File.exist?(log_filename)
+    end
   end
 
   def initialize(log_level)
@@ -26,6 +29,7 @@ class PgcatProcess
     @port = rand(20000..32760)
     @log_level = log_level
     @log_filename = "/tmp/pgcat_log_#{SecureRandom.urlsafe_base64}.log"
+    puts "Pgcat log file: #{@log_filename}" if ENV['PGCAT_KEEP_LOGS']
     @config_filename = "/tmp/pgcat_cfg_#{SecureRandom.urlsafe_base64}.toml"
 
     command_path = if ENV['CARGO_TARGET_DIR'] then
@@ -115,9 +119,23 @@ class PgcatProcess
   end
 
   def shutdown
+    # Unban all servers before shutdown to ensure clean state for next test
+    begin
+      admin_conn = PG.connect(admin_connection_string)
+      admin_conn.exec("UNBAN ALL")
+      admin_conn.close
+    rescue => e
+      # Pgcat might already be stopped, ignore errors
+      puts "Warning: Could not unban servers during shutdown: #{e.message}"
+    end
+    
     stop
-    File.delete(@config_filename) if File.exist?(@config_filename)
-    File.delete(@log_filename) if File.exist?(@log_filename)
+    
+    # Only delete files if PGCAT_KEEP_LOGS is not set
+    unless ENV['PGCAT_KEEP_LOGS']
+      File.delete(@config_filename) if File.exist?(@config_filename)
+      File.delete(@log_filename) if File.exist?(@log_filename)
+    end
   end
 
   def admin_connection_string

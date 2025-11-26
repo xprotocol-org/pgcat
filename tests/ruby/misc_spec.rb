@@ -269,8 +269,9 @@ describe "Miscellaneous" do
               rescue PG::SystemError
                 checkout_failure_count += 1
                 expect(conn.status).to eq(PG::CONNECTION_OK)
-              rescue PG::ConnectionBad
-                expect(checkout_failure_count).to eq(2)
+              rescue PG::ConnectionBad => e
+                expect(checkout_failure_count).to eq(0)
+                expect(e.message).to include("checkout failure limit reached")
                 expect(conn.status).to eq(PG::CONNECTION_BAD)
                 break
               end
