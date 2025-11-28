@@ -1573,6 +1573,10 @@ impl QueryRouter {
         self.pending_advisory_lock_action.take()
     }
 
+    pub fn set_pending_advisory_lock_action(&mut self, action: AdvisoryLockAction, keys: Vec<i64>) {
+        self.pending_advisory_lock_action = Some((action, keys));
+    }
+
 }
 
 impl Default for QueryRouter {

@@ -1009,8 +1009,16 @@ where
                         // Detect advisory lock queries to ensure routing to primary
                         // Even if we can't extract the key yet (due to placeholders),
                         // we need to set the routing preference
-                        let result = query_router.contains_session_advisory_lock(&message);
-                        debug!("Parse buffering: advisory lock detection result: {:?}", result);
+                        if let Some((action, keys)) = query_router.contains_session_advisory_lock(&message) {
+                            debug!(
+                                "Parse buffering: advisory lock detection result: {:?}",
+                                (action.clone(), keys.clone())
+                            );
+                            // Store it in query_router so it can be picked up by Sync later
+                            query_router.set_pending_advisory_lock_action(action, keys);
+                        } else {
+                            debug!("Parse buffering: advisory lock detection result: None (or placeholders)");
+                        }
                     }
 
                     if query_router.query_parser_enabled() {
@@ -1157,7 +1165,7 @@ where
 
                         checkout_failure_count += 1;
                         debug!("Checkout failure count: {} / {}", checkout_failure_count, checkout_limit);
-                        
+
                         continue;
                     }
                 };
