@@ -1009,8 +1009,22 @@ where
                         // Detect advisory lock queries to ensure routing to primary
                         // Even if we can't extract the key yet (due to placeholders),
                         // we need to set the routing preference
-                        let result = query_router.contains_session_advisory_lock(&message);
-                        debug!("Parse buffering: advisory lock detection result: {:?}", result);
+                        if let Some((action, keys)) = query_router.contains_session_advisory_lock(&message) {
+                            debug!(
+                                "Parse buffering: advisory lock detection result: {:?}",
+                                (action.clone(), keys.clone())
+                            );
+                            // Store it in query_router so it can be picked up by Sync later
+                            query_router.set_pending_advisory_lock_action(action, keys);
+                        } else {
+                            debug!("Parse buffering: advisory lock detection result: None (or placeholders)");
+                        }
+
+                        // Detect other session-scoped queries (cursors, temp tables, locks, SET)
+                        if let Some(session_action) = query_router.contains_session_scoped_query(&message) {
+                            debug!("Parse buffering: session-scoped action detected: {:?}", session_action);
+                            query_router.set_pending_session_action(session_action);
+                        }
                     }
 
                     if query_router.query_parser_enabled() {
@@ -1157,7 +1171,7 @@ where
 
                         checkout_failure_count += 1;
                         debug!("Checkout failure count: {} / {}", checkout_failure_count, checkout_limit);
-                        
+
                         continue;
                     }
                 };
@@ -1415,7 +1429,7 @@ where
                             }
                         }
 
-                        if !server.in_transaction() && !server.has_pinned_prepared_statements() && !server.has_advisory_lock() {
+                        if !server.in_transaction() && !server.has_pinned_prepared_statements() && !server.has_advisory_lock() && !server.has_session_scoped_state() {
                             // Report transaction executed statistics.
                             self.stats.transaction();
                             server
@@ -1506,6 +1520,12 @@ where
                         if let Some((action, keys)) = query_router.take_pending_advisory_lock_action() {
                             debug!("Setting advisory lock action on server from buffered Bind: {:?}, keys: {:?}", action, keys);
                             server.set_pending_advisory_lock_action(action, keys);
+                        }
+
+                        // If we detected session-scoped queries during Parse, set them on the server now
+                        if let Some(session_action) = query_router.take_pending_session_action() {
+                            debug!("Setting session-scoped action on server from buffered Parse: {:?}", session_action);
+                            server.set_pending_session_action(session_action);
                         }
 
                         match plugin_output {
@@ -1705,7 +1725,7 @@ where
 
                         self.buffer.clear();
 
-                        if !server.in_transaction() && !server.has_pinned_prepared_statements() && !server.has_advisory_lock() {
+                        if !server.in_transaction() && !server.has_pinned_prepared_statements() && !server.has_advisory_lock() && !server.has_session_scoped_state() {
                             self.stats.transaction();
                             server
                                 .stats()
@@ -1765,7 +1785,7 @@ where
                             }
                         };
 
-                        if !server.in_transaction() && !server.has_pinned_prepared_statements() && !server.has_advisory_lock() {
+                        if !server.in_transaction() && !server.has_pinned_prepared_statements() && !server.has_advisory_lock() && !server.has_session_scoped_state() {
                             self.stats.transaction();
                             server
                                 .stats()

@@ -294,6 +294,18 @@ pub struct Server {
     /// Pending advisory lock action awaiting server response.
     pending_advisory_lock_action: Option<(crate::query_router::AdvisoryLockAction, Vec<i64>)>,
 
+    /// Session-scoped cursors declared on this connection
+    cursors: std::collections::HashSet<String>,
+
+    /// Session-scoped temporary tables created on this connection
+    temp_tables: std::collections::HashSet<String>,
+
+    /// Session-scoped table locks held on this connection
+    table_locks: std::collections::HashSet<String>,
+
+    /// Session-scoped action pending server response
+    pending_session_action: Option<crate::query_router::SessionScopedAction>,
+
     /// Is there more data for the client to read.
     data_available: bool,
 
@@ -816,6 +828,10 @@ impl Server {
                         pinned_prepared_statements: std::collections::HashSet::new(),
                         advisory_lock_keys: std::collections::HashMap::new(),
                         pending_advisory_lock_action: None,
+                        cursors: std::collections::HashSet::new(),
+                        temp_tables: std::collections::HashSet::new(),
+                        table_locks: std::collections::HashSet::new(),
+                        pending_session_action: None,
                         in_copy_mode: false,
                         data_available: false,
                         bad: false,
@@ -1377,6 +1393,35 @@ impl Server {
         self.pending_advisory_lock_action = None;
     }
 
+    pub fn has_session_scoped_state(&self) -> bool {
+        !self.cursors.is_empty() || !self.temp_tables.is_empty() || !self.table_locks.is_empty()
+    }
+
+    pub fn set_pending_session_action(&mut self, action: crate::query_router::SessionScopedAction) {
+        use crate::query_router::SessionScopedAction;
+
+        match &action {
+            SessionScopedAction::DeclareCursor(name) => {
+                debug!("Session-scoped cursor declared: {}", name);
+                self.cursors.insert(name.clone());
+            }
+            SessionScopedAction::CreateTempTable(name) => {
+                debug!("Session-scoped temporary table created: {}", name);
+                self.temp_tables.insert(name.clone());
+            }
+            SessionScopedAction::LockTable(name) => {
+                debug!("Session-scoped table lock acquired: {}", name);
+                self.table_locks.insert(name.clone());
+            }
+            SessionScopedAction::SetCommand => {
+                debug!("Session-scoped SET command detected, marking for cleanup");
+                self.cleanup_state.needs_cleanup_set = true;
+            }
+        }
+
+        self.pending_session_action = Some(action);
+    }
+
     /// Currently copying data from client to server or vice-versa.
     pub fn in_copy_mode(&self) -> bool {
         self.in_copy_mode
@@ -1498,6 +1543,33 @@ impl Server {
             warn!(target: "pgcat::server::cleanup", "Server returned with advisory locks held, releasing all locks");
             self.query("SELECT pg_advisory_unlock_all()").await?;
             self.advisory_lock_keys.clear();
+        }
+
+        if self.has_session_scoped_state() {
+            let mut cleanup_queries = Vec::new();
+
+            if !self.cursors.is_empty() {
+                warn!(target: "pgcat::server::cleanup", "Server returned with {} open cursors, closing all", self.cursors.len());
+                for cursor_name in &self.cursors {
+                    cleanup_queries.push(format!("CLOSE {};", cursor_name));
+                }
+                self.cursors.clear();
+            }
+
+            if !self.temp_tables.is_empty() {
+                warn!(target: "pgcat::server::cleanup", "Server returned with {} temporary tables, they will be auto-dropped at transaction end or session end", self.temp_tables.len());
+                self.temp_tables.clear();
+            }
+
+            if !self.table_locks.is_empty() {
+                warn!(target: "pgcat::server::cleanup", "Server returned with {} table locks held, they will be auto-released", self.table_locks.len());
+                self.table_locks.clear();
+            }
+
+            if !cleanup_queries.is_empty() {
+                let cleanup_sql = cleanup_queries.join(" ");
+                self.query(&cleanup_sql).await?;
+            }
         }
 
         // Client disconnected but it performed session-altering operations such as

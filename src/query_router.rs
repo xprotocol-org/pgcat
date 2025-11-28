@@ -63,6 +63,14 @@ pub enum AdvisoryLockAction {
     UnlockAll,
 }
 
+#[derive(PartialEq, Debug, Clone)]
+pub enum SessionScopedAction {
+    DeclareCursor(String),
+    CreateTempTable(String),
+    LockTable(String),
+    SetCommand,
+}
+
 #[derive(Clone, Debug)]
 enum ParameterFormat {
     Text,
@@ -79,6 +87,10 @@ static CUSTOM_SQL_REGEX_LIST: OnceCell<Vec<Regex>> = OnceCell::new();
 
 static ADVISORY_LOCK_REGEX: OnceCell<Regex> = OnceCell::new();
 static DEALLOCATE_REGEX: OnceCell<Regex> = OnceCell::new();
+static DECLARE_CURSOR_REGEX: OnceCell<Regex> = OnceCell::new();
+static CREATE_TEMP_TABLE_REGEX: OnceCell<Regex> = OnceCell::new();
+static LOCK_TABLE_REGEX: OnceCell<Regex> = OnceCell::new();
+static SET_COMMAND_REGEX: OnceCell<Regex> = OnceCell::new();
 
 #[derive(Debug, Clone, PartialEq)]
 enum DatabaseActivityState {
@@ -117,6 +129,9 @@ pub struct QueryRouter {
 
     // Advisory lock action and keys extracted from Bind, ready to be set on server
     pending_advisory_lock_action: Option<(AdvisoryLockAction, Vec<i64>)>,
+
+    // Pending session-scoped action detected during Parse phase
+    pending_session_action: Option<SessionScopedAction>,
 }
 
 struct ExtractedExprsAndTables<'a> {
@@ -183,6 +198,74 @@ impl QueryRouter {
             return false;
         }
 
+        let declare_cursor_regex = match Regex::new(
+            r"(?i)^\s*DECLARE\s+([\w_]+)\s+.*CURSOR",
+        ) {
+            Ok(rgx) => rgx,
+            Err(err) => {
+                error!(
+                    "QueryRouter::setup Could not compile declare cursor regex: {:?}",
+                    err
+                );
+                return false;
+            }
+        };
+
+        if DECLARE_CURSOR_REGEX.set(declare_cursor_regex).is_err() {
+            return false;
+        }
+
+        let create_temp_table_regex = match Regex::new(
+            r"(?i)^\s*CREATE\s+(TEMP|TEMPORARY)\s+TABLE\s+(IF\s+NOT\s+EXISTS\s+)?([\w_.]+)",
+        ) {
+            Ok(rgx) => rgx,
+            Err(err) => {
+                error!(
+                    "QueryRouter::setup Could not compile create temp table regex: {:?}",
+                    err
+                );
+                return false;
+            }
+        };
+
+        if CREATE_TEMP_TABLE_REGEX.set(create_temp_table_regex).is_err() {
+            return false;
+        }
+
+        let lock_table_regex = match Regex::new(
+            r"(?i)^\s*LOCK\s+TABLE\s+([\w_.]+)",
+        ) {
+            Ok(rgx) => rgx,
+            Err(err) => {
+                error!(
+                    "QueryRouter::setup Could not compile lock table regex: {:?}",
+                    err
+                );
+                return false;
+            }
+        };
+
+        if LOCK_TABLE_REGEX.set(lock_table_regex).is_err() {
+            return false;
+        }
+
+        let set_command_regex = match Regex::new(
+            r"(?i)^\s*SET\s+\w+",
+        ) {
+            Ok(rgx) => rgx,
+            Err(err) => {
+                error!(
+                    "QueryRouter::setup Could not compile set command regex: {:?}",
+                    err
+                );
+                return false;
+            }
+        };
+
+        if SET_COMMAND_REGEX.set(set_command_regex).is_err() {
+            return false;
+        }
+
         CUSTOM_SQL_REGEX_SET.set(set).is_ok()
     }
 
@@ -223,6 +306,7 @@ impl QueryRouter {
             placeholders: Vec::new(),
             pending_advisory_lock_parse: None,
             pending_advisory_lock_action: None,
+            pending_session_action: None,
         }
     }
 
@@ -1571,6 +1655,90 @@ impl QueryRouter {
 
     pub fn take_pending_advisory_lock_action(&mut self) -> Option<(AdvisoryLockAction, Vec<i64>)> {
         self.pending_advisory_lock_action.take()
+    }
+
+    pub fn set_pending_advisory_lock_action(&mut self, action: AdvisoryLockAction, keys: Vec<i64>) {
+        self.pending_advisory_lock_action = Some((action, keys));
+    }
+
+    pub fn contains_session_scoped_query(&mut self, message: &BytesMut) -> Option<SessionScopedAction> {
+        let mut message_cursor = Cursor::new(message);
+        let code = message_cursor.get_u8() as char;
+        let _len = message_cursor.get_i32();
+
+        let query = match code {
+            'Q' => {
+                let query = message_cursor.read_string().ok()?;
+                query
+            }
+            'P' => {
+                let _name = message_cursor.read_string().ok()?;
+                let query = message_cursor.read_string().ok()?;
+                query
+            }
+            _ => return None,
+        };
+
+        debug!("Checking query for session-scoped features: {}", query);
+
+        if let Some(cursor_regex) = DECLARE_CURSOR_REGEX.get() {
+            if let Some(captures) = cursor_regex.captures(&query) {
+                if let Some(cursor_name) = captures.get(1) {
+                    let name = cursor_name.as_str().to_string();
+                    debug!("Session-scoped DECLARE CURSOR detected: {}", name);
+                    self.active_role = Some(Role::Primary);
+                    return Some(SessionScopedAction::DeclareCursor(name));
+                }
+            }
+        }
+
+        if let Some(temp_table_regex) = CREATE_TEMP_TABLE_REGEX.get() {
+            if let Some(captures) = temp_table_regex.captures(&query) {
+                if let Some(table_name) = captures.get(3) {
+                    let name = table_name.as_str().to_string();
+                    debug!("Session-scoped CREATE TEMPORARY TABLE detected: {}", name);
+                    self.active_role = Some(Role::Primary);
+                    return Some(SessionScopedAction::CreateTempTable(name));
+                }
+            }
+        }
+
+        if let Some(lock_table_regex) = LOCK_TABLE_REGEX.get() {
+            if let Some(captures) = lock_table_regex.captures(&query) {
+                if let Some(table_name) = captures.get(1) {
+                    let name = table_name.as_str().to_string();
+                    debug!("Session-scoped LOCK TABLE detected: {}", name);
+                    self.active_role = Some(Role::Primary);
+                    return Some(SessionScopedAction::LockTable(name));
+                }
+            }
+        }
+
+        if let Some(set_command_regex) = SET_COMMAND_REGEX.get() {
+            if set_command_regex.is_match(&query) {
+                let query_upper = query.to_uppercase();
+
+                if query_upper.contains("SET SERVER ROLE")
+                    || query_upper.contains("SET SHARDING KEY")
+                    || query_upper.contains("SET SHARD TO")
+                    || query_upper.contains("SET PRIMARY READS") {
+                    debug!("Ignoring pgcat custom SET command");
+                } else {
+                    debug!("Session-scoped SET command detected");
+                    return Some(SessionScopedAction::SetCommand);
+                }
+            }
+        }
+
+        None
+    }
+
+    pub fn take_pending_session_action(&mut self) -> Option<SessionScopedAction> {
+        self.pending_session_action.take()
+    }
+
+    pub fn set_pending_session_action(&mut self, action: SessionScopedAction) {
+        self.pending_session_action = Some(action);
     }
 
 }
