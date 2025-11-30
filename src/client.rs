@@ -14,7 +14,7 @@ use tokio::sync::mpsc::Sender;
 use crate::admin::{generate_server_parameters_for_admin, handle_admin};
 use crate::auth_passthrough::refetch_auth_hash;
 use crate::config::{
-    get_config, get_idle_client_in_transaction_timeout, Address, AuthType, PoolMode,
+    get_config, get_idle_client_in_transaction_timeout, Address, AuthType, PoolMode, Role,
 };
 use crate::constants::*;
 use crate::messages::*;
@@ -964,6 +964,8 @@ where
                     }
 
                     if query_router.query_parser_enabled() {
+                        query_router.set_default_role();
+
                         match query_router.parse(&message) {
                             Ok(ast) => {
                                 let plugin_result = query_router.execute_plugins(&ast).await;
@@ -991,6 +993,7 @@ where
                                     "Query parsing error: {} (client: {})",
                                     error, client_identifier
                                 );
+                                // active_role is already Primary (if splitting enabled) or Default.
                             }
                         }
                     }
@@ -1041,6 +1044,7 @@ where
                                     "Query parsing error: {} (client: {})",
                                     error, client_identifier
                                 );
+                                query_router.set_role(Role::Primary);
                             }
                         };
                     }
@@ -1119,12 +1123,14 @@ where
 
             let mut checkout_failure_count = 0;
             let (mut reference, address) = loop {
+                warn!("DEBUG: pool.get called with shard: {:?}, role: {:?}", query_router.shard(), query_router.role());
                 if checkout_failure_count >= checkout_limit {
                     error!(
                         "Checkout failure limit reached ({} / {}) - disconnecting client",
                         checkout_failure_count, checkout_limit
                     );
-                    self.stats.idle();
+                    self.stats.checkout_error();
+                    self.stats.disconnect();
                     error_response_terminal(
                         &mut self.write,
                         &format!(
@@ -1133,7 +1139,6 @@ where
                         ),
                     )
                     .await?;
-                    self.stats.disconnect();
                     return Ok(());
                 }
 
@@ -1146,7 +1151,7 @@ where
                         conn
                     }
                     Err(err) => {
-                        self.stats.idle();
+                        self.stats.checkout_error();
 
                         if message[0] as char == 'S' {
                             error!("Got Sync message but failed to get a connection from the pool");
@@ -1201,7 +1206,8 @@ where
                                 "Checkout failure limit reached ({} / {}) - disconnecting client",
                                 checkout_failure_count, checkout_limit
                             );
-                            self.stats.idle();
+                            self.stats.checkout_error();
+                            self.stats.disconnect();
                             error_response_terminal(
                                 &mut self.write,
                                 &format!(
@@ -1210,7 +1216,6 @@ where
                                 ),
                             )
                             .await?;
-                            self.stats.disconnect();
                             return Ok(());
                         }
 
@@ -1342,16 +1347,21 @@ where
                             // We don't want to parse again if we already parsed it as the initial message
                             let ast = match initial_parsed_ast {
                                 Some(_) => Some(initial_parsed_ast.take().unwrap()),
-                                None => match query_router.parse(&message) {
-                                    Ok(ast) => Some(ast),
-                                    Err(error) => {
-                                        warn!(
-                                            "Query parsing error: {} (client: {})",
-                                            error, client_identifier
-                                        );
-                                        None
+                                None => {
+                                    query_router.set_default_role();
+
+                                    match query_router.parse(&message) {
+                                        Ok(ast) => Some(ast),
+                                        Err(error) => {
+                                            warn!(
+                                                "Query parsing error: {} (client: {})",
+                                                error, client_identifier
+                                            );
+                                            // active_role is already Primary (if splitting enabled) or Default.
+                                            None
+                                        }
                                     }
-                                },
+                                }
                             };
 
                             if let Some(ast) = ast {
@@ -1370,6 +1380,8 @@ where
 
                                     _ => (),
                                 };
+
+                                let _ = query_router.infer(&ast);
                             }
                         }
 
@@ -1466,10 +1478,13 @@ where
                         // to ensure proper routing. Don't call contains_session_advisory_lock again here.
 
                         if query_router.query_parser_enabled() {
+                            query_router.set_default_role();
+
                             if let Ok(ast) = query_router.parse(&message) {
                                 if let Ok(output) = query_router.execute_plugins(&ast).await {
                                     plugin_output = Some(output);
                                 }
+                                let _ = query_router.infer(&ast);
                             }
                         }
 
@@ -2302,6 +2317,7 @@ where
 
 impl<S, T> Drop for Client<S, T> {
     fn drop(&mut self) {
+        self.stats.disconnect();
         let mut guard = self.client_server_map.lock();
         guard.remove(&(self.process_id, self.secret_key));
 

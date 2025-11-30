@@ -32,7 +32,7 @@ if [ -n "$INTERACTIVE_TEST_ENVIRONMENT" ]; then
     exit 0
 fi
 
-rm -rf /app/target/ || true
+find /app/target -mindepth 1 -delete
 rm /app/*.profraw || true
 rm /app/pgcat.profdata || true
 rm -rf /app/cov || true
@@ -44,7 +44,6 @@ export RUSTFLAGS="-Ccodegen-units=1 -Copt-level=0 -Clink-dead-code -Coverflow-ch
 export RUSTDOCFLAGS="-Cpanic=abort"
 
 cd /app/
-cargo clean
 cargo build
 cargo test --tests
 

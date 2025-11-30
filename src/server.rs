@@ -365,6 +365,7 @@ impl Server {
         cleanup_connections: bool,
         log_client_parameter_status_changes: bool,
         prepared_statement_cache_size: usize,
+        tcp_connect_timeout: u64,
     ) -> Result<Server, Error> {
         let cached_resolver = CACHED_RESOLVER.load();
         let mut addr_set: Option<AddrSet> = None;
@@ -384,8 +385,13 @@ impl Server {
             }
         };
 
-        let mut stream =
-            match TcpStream::connect(&format!("{}:{}", &address.host, address.port)).await {
+        let mut stream = match tokio::time::timeout(
+            tokio::time::Duration::from_millis(tcp_connect_timeout),
+            TcpStream::connect(&format!("{}:{}", &address.host, address.port)),
+        )
+        .await
+        {
+            Ok(res) => match res {
                 Ok(stream) => stream,
                 Err(err) => {
                     error!("Could not connect to server: {}", err);
@@ -394,7 +400,14 @@ impl Server {
                         err
                     )));
                 }
-            };
+            },
+            Err(_) => {
+                return Err(Error::SocketError(format!(
+                    "Connection timeout: {}ms",
+                    tcp_connect_timeout
+                )));
+            }
+        };
 
         // TCP timeouts.
         configure_socket(&stream);
@@ -994,6 +1007,11 @@ impl Server {
                         // Idle, transaction over.
                         'I' => {
                             self.in_transaction = false;
+                            // Transaction is over, so table locks are automatically released by Postgres
+                            if !self.table_locks.is_empty() {
+                                debug!("Transaction ended, clearing {} table locks", self.table_locks.len());
+                                self.table_locks.clear();
+                            }
                         }
 
                         // Some error occurred, the transaction was rolled back.
@@ -1550,19 +1568,24 @@ impl Server {
 
             if !self.cursors.is_empty() {
                 warn!(target: "pgcat::server::cleanup", "Server returned with {} open cursors, closing all", self.cursors.len());
-                for cursor_name in &self.cursors {
-                    cleanup_queries.push(format!("CLOSE {};", cursor_name));
-                }
+                // CLOSE ALL is cleaner and safer than iterating names
+                cleanup_queries.push("CLOSE ALL;".to_string());
                 self.cursors.clear();
             }
 
             if !self.temp_tables.is_empty() {
-                warn!(target: "pgcat::server::cleanup", "Server returned with {} temporary tables, they will be auto-dropped at transaction end or session end", self.temp_tables.len());
+                warn!(target: "pgcat::server::cleanup", "Server returned with {} temporary tables, discarding temp", self.temp_tables.len());
+                // DISCARD TEMP drops all temporary tables
+                cleanup_queries.push("DISCARD TEMP;".to_string());
                 self.temp_tables.clear();
             }
 
+            // Table locks are automatically released at transaction end, but if we are here
+            // and still have them tracked, it means we might have missed the transaction end
+            // or something else happened. Clearing the tracking set is enough since we are
+            // rolling back or ensuring we are idle.
             if !self.table_locks.is_empty() {
-                warn!(target: "pgcat::server::cleanup", "Server returned with {} table locks held, they will be auto-released", self.table_locks.len());
+                warn!(target: "pgcat::server::cleanup", "Server returned with {} table locks held, clearing tracking", self.table_locks.len());
                 self.table_locks.clear();
             }
 
@@ -1657,6 +1680,7 @@ impl Server {
             true,
             false,
             0,
+            get_config().general.tcp_connect_timeout,
         )
         .await?;
         debug!("Connected!, sending query.");

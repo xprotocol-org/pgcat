@@ -219,7 +219,9 @@ pub struct User {
     pub server_lifetime: Option<u64>,
     #[serde(default)] // 0
     pub statement_timeout: u64,
-    pub connect_timeout: Option<u64>,
+    #[serde(alias = "connect_timeout")]
+    pub fetch_timeout: Option<u64>,
+    pub tcp_connect_timeout: Option<u64>,
     pub idle_timeout: Option<u64>,
 }
 
@@ -236,7 +238,8 @@ impl Default for User {
             statement_timeout: 0,
             pool_mode: None,
             server_lifetime: None,
-            connect_timeout: None,
+            fetch_timeout: None,
+            tcp_connect_timeout: None,
             idle_timeout: None,
         }
     }
@@ -276,8 +279,11 @@ pub struct General {
     #[serde(default = "General::default_prometheus_exporter_port")]
     pub prometheus_exporter_port: i16,
 
-    #[serde(default = "General::default_connect_timeout")]
-    pub connect_timeout: u64,
+    #[serde(default = "General::default_fetch_timeout", alias = "connect_timeout")]
+    pub fetch_timeout: u64,
+
+    #[serde(default = "General::default_tcp_connect_timeout")]
+    pub tcp_connect_timeout: u64,
 
     #[serde(default = "General::default_idle_timeout")]
     pub idle_timeout: u64,
@@ -374,7 +380,11 @@ impl General {
         1000 * 60 * 60 // 1 hour
     }
 
-    pub fn default_connect_timeout() -> u64 {
+    pub fn default_fetch_timeout() -> u64 {
+        1000
+    }
+
+    pub fn default_tcp_connect_timeout() -> u64 {
         1000
     }
 
@@ -453,7 +463,8 @@ impl Default for General {
             port: Self::default_port(),
             enable_prometheus_exporter: Some(false),
             prometheus_exporter_port: 9930,
-            connect_timeout: General::default_connect_timeout(),
+            fetch_timeout: General::default_fetch_timeout(),
+            tcp_connect_timeout: General::default_tcp_connect_timeout(),
             idle_timeout: General::default_idle_timeout(),
             tcp_keepalives_idle: Self::default_tcp_keepalives_idle(),
             tcp_keepalives_count: Self::default_tcp_keepalives_count(),
@@ -561,7 +572,11 @@ pub struct Pool {
     pub primary_reads_enabled: bool,
 
     /// Maximum time to allow for establishing a new server connection.
-    pub connect_timeout: Option<u64>,
+    #[serde(alias = "connect_timeout")]
+    pub fetch_timeout: Option<u64>,
+
+    /// Maximum time to allow for establishing a new TCP connection.
+    pub tcp_connect_timeout: Option<u64>,
 
     /// Close idle connections that have been opened for longer than this.
     pub idle_timeout: Option<u64>,
@@ -804,7 +819,8 @@ impl Default for Pool {
             query_parser_max_length: None,
             query_parser_read_write_splitting: false,
             primary_reads_enabled: false,
-            connect_timeout: None,
+            fetch_timeout: None,
+            tcp_connect_timeout: None,
             idle_timeout: None,
             server_lifetime: None,
             sharding_function: ShardingFunction::PgBigintHash,
@@ -1189,8 +1205,12 @@ impl From<&Config> for std::collections::HashMap<String, String> {
                 config.general.prometheus_exporter_port.to_string(),
             ),
             (
-                "connect_timeout".to_string(),
-                config.general.connect_timeout.to_string(),
+                "fetch_timeout".to_string(),
+                config.general.fetch_timeout.to_string(),
+            ),
+            (
+                "tcp_connect_timeout".to_string(),
+                config.general.tcp_connect_timeout.to_string(),
             ),
             (
                 "idle_timeout".to_string(),
@@ -1237,7 +1257,7 @@ impl Config {
             "Healthcheck timeout: {}ms",
             self.general.healthcheck_timeout
         );
-        info!("Connection timeout: {}ms", self.general.connect_timeout);
+        info!("Fetch timeout: {}ms", self.general.fetch_timeout);
         info!("Idle timeout: {}ms", self.general.idle_timeout);
         info!(
             "Log client connections: {}",
@@ -1303,13 +1323,21 @@ impl Config {
                 "[pool: {}] Load Balancing mode: {:?}",
                 pool_name, pool_config.load_balancing_mode
             );
-            let connect_timeout = match pool_config.connect_timeout {
-                Some(connect_timeout) => connect_timeout,
-                None => self.general.connect_timeout,
+            let fetch_timeout = match pool_config.fetch_timeout {
+                Some(fetch_timeout) => fetch_timeout,
+                None => self.general.fetch_timeout,
             };
             info!(
-                "[pool: {}] Connection timeout: {}ms",
-                pool_name, connect_timeout
+                "[pool: {}] Fetch timeout: {}ms",
+                pool_name, fetch_timeout
+            );
+            let tcp_connect_timeout = match pool_config.tcp_connect_timeout {
+                Some(tcp_connect_timeout) => tcp_connect_timeout,
+                None => self.general.tcp_connect_timeout,
+            };
+            info!(
+                "[pool: {}] TCP connection timeout: {}ms",
+                pool_name, tcp_connect_timeout
             );
             let idle_timeout = match pool_config.idle_timeout {
                 Some(idle_timeout) => idle_timeout,
@@ -1438,11 +1466,20 @@ impl Config {
                     }
                 );
                 info!(
-                    "[pool: {}][user: {}] Connection timeout: {}",
+                    "[pool: {}][user: {}] Fetch timeout: {}",
                     pool_name,
                     user.1.username,
-                    match user.1.connect_timeout {
-                        Some(connect_timeout) => format!("{}ms", connect_timeout),
+                    match user.1.fetch_timeout {
+                        Some(fetch_timeout) => format!("{}ms", fetch_timeout),
+                        None => "not set".to_string(),
+                    }
+                );
+                info!(
+                    "[pool: {}][user: {}] TCP connection timeout: {}",
+                    pool_name,
+                    user.1.username,
+                    match user.1.tcp_connect_timeout {
+                        Some(tcp_connect_timeout) => format!("{}ms", tcp_connect_timeout),
                         None => "not set".to_string(),
                     }
                 );

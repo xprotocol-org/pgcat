@@ -594,7 +594,7 @@ where
     let config: HashMap<String, String> = config.into();
 
     // Configs that cannot be changed without restarting.
-    let immutables = ["host", "port", "connect_timeout"];
+    let immutables = ["host", "port", "fetch_timeout", "tcp_connect_timeout"];
 
     // Columns
     let columns = vec![

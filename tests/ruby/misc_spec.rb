@@ -106,7 +106,7 @@ describe "Miscellaneous" do
     it "does not send packets that client does not expect during extended protocol sequence" do
       new_configs = processes.pgcat.current_config
 
-      new_configs["general"]["connect_timeout"] = 500
+      new_configs["general"]["fetch_timeout"] = 500
       new_configs["general"]["ban_time"] = 1
       new_configs["general"]["shutdown_timeout"] = 1
       new_configs["pools"]["sharded_db"]["users"]["0"]["pool_size"] = 1
@@ -117,7 +117,7 @@ describe "Miscellaneous" do
       25.times do
         Thread.new do
           conn = PG::connect(processes.pgcat.connection_string("sharded_db", "sharding_user"))
-          conn.async_exec("SELECT pg_sleep(5)") rescue PG::SystemError
+          conn.async_exec("SELECT pg_sleep(5)") rescue PG::Error
         ensure
           conn&.close
         end
@@ -127,8 +127,8 @@ describe "Miscellaneous" do
       conn_under_test = PG::connect(processes.pgcat.connection_string("sharded_db", "sharding_user"))
       stdout, stderr = with_captured_stdout_stderr do
         15.times do |i|
-          conn_under_test.async_exec("SELECT 1") rescue PG::SystemError
-          conn_under_test.exec_params("SELECT #{i} + $1", [i]) rescue PG::SystemError
+          conn_under_test.async_exec("SELECT 1") rescue PG::Error
+          conn_under_test.exec_params("SELECT #{i} + $1", [i]) rescue PG::Error
           sleep 1
         end
       end
@@ -192,7 +192,7 @@ describe "Miscellaneous" do
     context "when no checkout failure limit is set" do
       before do
         new_configs = processes.pgcat.current_config
-        new_configs["general"]["connect_timeout"] = 200
+        new_configs["general"]["fetch_timeout"] = 200
         new_configs["pools"]["sharded_db"]["users"]["0"]["pool_size"] = 1
         processes.pgcat.update_config(new_configs)
         processes.pgcat.reload_config
@@ -207,7 +207,7 @@ describe "Miscellaneous" do
               begin
                 conn.async_exec("SELECT pg_sleep(0.5);")
                 expect(conn.status).to eq(PG::CONNECTION_OK)
-              rescue PG::SystemError
+              rescue PG::Error
                 expect(conn.status).to eq(PG::CONNECTION_OK)
               end
             end
@@ -220,7 +220,7 @@ describe "Miscellaneous" do
     context "when checkout failure limit is set high" do
       before do
         new_configs = processes.pgcat.current_config
-        new_configs["general"]["connect_timeout"] = 200
+        new_configs["general"]["fetch_timeout"] = 200
         new_configs["pools"]["sharded_db"]["users"]["0"]["pool_size"] = 1
         new_configs["pools"]["sharded_db"]["checkout_failure_limit"] = 10000
         processes.pgcat.update_config(new_configs)
@@ -236,7 +236,7 @@ describe "Miscellaneous" do
               begin
                 conn.async_exec("SELECT pg_sleep(0.5);")
                 expect(conn.status).to eq(PG::CONNECTION_OK)
-              rescue PG::SystemError
+              rescue PG::Error
                 expect(conn.status).to eq(PG::CONNECTION_OK)
               end
             end
@@ -249,7 +249,7 @@ describe "Miscellaneous" do
     context "when checkout failure limit is set low" do
       before do
         new_configs = processes.pgcat.current_config
-        new_configs["general"]["connect_timeout"] = 200
+        new_configs["general"]["fetch_timeout"] = 200
         new_configs["pools"]["sharded_db"]["users"]["0"]["pool_size"] = 1
         new_configs["pools"]["sharded_db"]["checkout_failure_limit"] = 2
         processes.pgcat.update_config(new_configs)
@@ -266,14 +266,14 @@ describe "Miscellaneous" do
               begin
                 conn.async_exec("SELECT pg_sleep(1);")
                 expect(conn.status).to eq(PG::CONNECTION_OK)
-              rescue PG::SystemError
-                checkout_failure_count += 1
-                expect(conn.status).to eq(PG::CONNECTION_OK)
               rescue PG::ConnectionBad => e
                 expect(checkout_failure_count).to eq(0)
                 expect(e.message).to include("checkout failure limit reached")
                 expect(conn.status).to eq(PG::CONNECTION_BAD)
                 break
+              rescue PG::Error
+                checkout_failure_count += 1
+                expect(conn.status).to eq(PG::CONNECTION_OK)
               end
             end
             conn.close

@@ -102,6 +102,14 @@ class PgInstance
     with_connection { |c| c.async_exec("SELECT SUM(calls) FROM pg_stat_statements WHERE query = '#{query}'")[0]["sum"].to_i }
   end
 
+  def query_count
+    with_connection { |c| c.async_exec("SELECT COALESCE(SUM(calls), 0) FROM pg_stat_statements WHERE query NOT ILIKE '%pg_stat_statements%'")[0]["coalesce"].to_i }
+  end
+
+  def count_select_1
+    with_connection { |c| c.async_exec("SELECT COALESCE(SUM(calls), 0) FROM pg_stat_statements WHERE query LIKE '%SELECT 1%' OR query = 'SELECT $1'")[0]["coalesce"].to_i }
+  end
+
   def count_select_1_plus_2
     with_connection { |c| c.async_exec("SELECT SUM(calls) FROM pg_stat_statements WHERE query LIKE '%SELECT $1 + $2%'")[0]["sum"].to_i }
   end

@@ -45,7 +45,8 @@ pub static POOLS: Lazy<ArcSwap<PoolMap>> = Lazy::new(|| ArcSwap::from_pointee(Ha
 static POOLS_WRITE_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
 struct ConnectionTimeouts {
-    connect: u64,
+    fetch: u64,
+    tcp_connect: u64,
     idle: u64,
     lifetime: u64,
 }
@@ -681,6 +682,7 @@ impl ConnectionPool {
         }
 
         let plugins = pool_config.plugins.clone().or_else(|| config.plugins.clone());
+        let timeouts = Self::resolve_timeouts(user, pool_config, config);
 
         let manager = ServerPool::new(
             address.clone(),
@@ -692,9 +694,9 @@ impl ConnectionPool {
             pool_config.cleanup_server_connections,
             pool_config.log_client_parameter_status_changes,
             pool_config.prepared_statements_cache_size,
+            timeouts.tcp_connect,
         );
 
-        let timeouts = Self::resolve_timeouts(user, pool_config, config);
         let reaper_rate = Self::calculate_reaper_rate(&timeouts);
         let queue_strategy = Self::select_queue_strategy(config);
 
@@ -703,7 +705,7 @@ impl ConnectionPool {
         let builder = Pool::builder()
             .max_size(user.pool_size)
             .min_idle(user.min_pool_size)
-            .connection_timeout(std::time::Duration::from_millis(timeouts.connect))
+            .connection_timeout(std::time::Duration::from_millis(timeouts.fetch))
             .idle_timeout(Some(std::time::Duration::from_millis(timeouts.idle)))
             .max_lifetime(Some(std::time::Duration::from_millis(timeouts.lifetime)))
             .reaper_rate(std::time::Duration::from_millis(reaper_rate))
@@ -729,9 +731,12 @@ impl ConnectionPool {
         config: &crate::config::Config,
     ) -> ConnectionTimeouts {
         ConnectionTimeouts {
-            connect: user.connect_timeout
-                .or(pool_config.connect_timeout)
-                .unwrap_or(config.general.connect_timeout),
+            fetch: user.fetch_timeout
+                .or(pool_config.fetch_timeout)
+                .unwrap_or(config.general.fetch_timeout),
+            tcp_connect: user.tcp_connect_timeout
+                .or(pool_config.tcp_connect_timeout)
+                .unwrap_or(config.general.tcp_connect_timeout),
             idle: user.idle_timeout
                 .or(pool_config.idle_timeout)
                 .unwrap_or(config.general.idle_timeout),
@@ -999,6 +1004,7 @@ impl ConnectionPool {
         role: Option<Role>,         // primary or replica
         client_stats: &ClientStats, // client id
     ) -> Result<(PooledConnection<'_, ServerPool>, Address), Error> {
+        eprintln!("DEBUG: pool.get called with role: {:?}", role);
         if !self.validated() {
             self.validate().await?;
         }
@@ -1018,7 +1024,13 @@ impl ConnectionPool {
             .addresses
             .iter()
             .flatten()
-            .filter(|address| address.role == role)
+            .filter(|address| {
+                let matched = address.role == role;
+                if matched {
+                     eprintln!("DEBUG: Candidate found: {:?} matching role {:?}", address, role);
+                }
+                matched
+            })
             .collect::<Vec<&Address>>();
 
         // We start with a shuffled list of addresses even if we end up resorting
@@ -1438,6 +1450,9 @@ pub struct ServerPool {
 
     /// Prepared statement cache size
     prepared_statement_cache_size: usize,
+
+    /// TCP connection timeout
+    tcp_connect_timeout: u64,
 }
 
 impl ServerPool {
@@ -1452,6 +1467,7 @@ impl ServerPool {
         cleanup_connections: bool,
         log_client_parameter_status_changes: bool,
         prepared_statement_cache_size: usize,
+        tcp_connect_timeout: u64,
     ) -> ServerPool {
         ServerPool {
             address,
@@ -1463,6 +1479,7 @@ impl ServerPool {
             cleanup_connections,
             log_client_parameter_status_changes,
             prepared_statement_cache_size,
+            tcp_connect_timeout,
         }
     }
 }
@@ -1480,6 +1497,7 @@ impl ManageConnection for ServerPool {
         let cleanup_connections = self.cleanup_connections;
         let log_client_parameter_status_changes = self.log_client_parameter_status_changes;
         let prepared_statement_cache_size = self.prepared_statement_cache_size;
+        let tcp_connect_timeout = self.tcp_connect_timeout;
         let plugins = self.plugins.clone();
 
         async move {
@@ -1502,6 +1520,7 @@ impl ManageConnection for ServerPool {
                 cleanup_connections,
                 log_client_parameter_status_changes,
                 prepared_statement_cache_size,
+                tcp_connect_timeout,
             )
             .await
             {
@@ -1631,7 +1650,8 @@ mod tests {
             min_pool_size: Some(2),
             statement_timeout: 0,
             pool_mode: None,
-            connect_timeout: None,
+            fetch_timeout: None,
+            tcp_connect_timeout: None,
             idle_timeout: None,
             server_lifetime: None,
         }
@@ -1670,7 +1690,8 @@ mod tests {
             query_parser_max_length: None,
             query_parser_read_write_splitting: false,
             primary_reads_enabled: true,
-            connect_timeout: Some(5000),
+            fetch_timeout: Some(5000),
+            tcp_connect_timeout: Some(5000),
             idle_timeout: Some(30000),
             checkout_failure_limit: None,
             server_lifetime: Some(3600000),
@@ -1709,7 +1730,8 @@ mod tests {
                 prometheus_exporter_port: 9930,
                 admin_username: "admin".to_string(),
                 admin_password: "admin".to_string(),
-                connect_timeout: 5000,
+                fetch_timeout: 5000,
+                tcp_connect_timeout: 5000,
                 idle_timeout: 30000,
                 server_lifetime: 3600000,
                 idle_client_in_transaction_timeout: 0,
@@ -1790,7 +1812,8 @@ mod tests {
     #[test]
     fn test_resolve_timeouts_user_override() {
         let mut user = create_test_user();
-        user.connect_timeout = Some(1000);
+        user.fetch_timeout = Some(1000);
+        user.tcp_connect_timeout = Some(1000);
         user.idle_timeout = Some(2000);
         user.server_lifetime = Some(3000);
 
@@ -1799,7 +1822,8 @@ mod tests {
 
         let timeouts = ConnectionPool::resolve_timeouts(&user, &pool_config, &config);
 
-        assert_eq!(timeouts.connect, 1000);
+        assert_eq!(timeouts.fetch, 1000);
+        assert_eq!(timeouts.tcp_connect, 1000);
         assert_eq!(timeouts.idle, 2000);
         assert_eq!(timeouts.lifetime, 3000);
     }
@@ -1812,7 +1836,8 @@ mod tests {
 
         let timeouts = ConnectionPool::resolve_timeouts(&user, &pool_config, &config);
 
-        assert_eq!(timeouts.connect, 5000);
+        assert_eq!(timeouts.fetch, 5000);
+        assert_eq!(timeouts.tcp_connect, 1000);
         assert_eq!(timeouts.idle, 30000);
         assert_eq!(timeouts.lifetime, 3600000);
     }
@@ -1820,12 +1845,14 @@ mod tests {
     #[test]
     fn test_resolve_timeouts_default() {
         let mut user = create_test_user();
-        user.connect_timeout = None;
+        user.fetch_timeout = None;
+        user.tcp_connect_timeout = None;
         user.idle_timeout = None;
         user.server_lifetime = None;
 
         let mut pool_config = create_test_pool_config();
-        pool_config.connect_timeout = None;
+        pool_config.fetch_timeout = None;
+        pool_config.tcp_connect_timeout = None;
         pool_config.idle_timeout = None;
         pool_config.server_lifetime = None;
 
@@ -1833,7 +1860,8 @@ mod tests {
 
         let timeouts = ConnectionPool::resolve_timeouts(&user, &pool_config, &config);
 
-        assert_eq!(timeouts.connect, config.general.connect_timeout);
+        assert_eq!(timeouts.fetch, config.general.fetch_timeout);
+        assert_eq!(timeouts.tcp_connect, config.general.tcp_connect_timeout);
         assert_eq!(timeouts.idle, config.general.idle_timeout);
         assert_eq!(timeouts.lifetime, config.general.server_lifetime);
     }
@@ -1841,7 +1869,8 @@ mod tests {
     #[test]
     fn test_calculate_reaper_rate() {
         let timeouts = ConnectionTimeouts {
-            connect: 5000,
+            fetch: 5000,
+            tcp_connect: 5000,
             idle: 30000,
             lifetime: 60000,
         };
@@ -1853,7 +1882,8 @@ mod tests {
     #[test]
     fn test_calculate_reaper_rate_uses_minimum() {
         let timeouts = ConnectionTimeouts {
-            connect: 5000,
+            fetch: 5000,
+            tcp_connect: 5000,
             idle: 10000,
             lifetime: 60000,
         };

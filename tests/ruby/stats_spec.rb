@@ -152,7 +152,7 @@ describe "Stats" do
     context "client fail to checkout connection from the pool" do
       it "counts clients as idle" do
         new_configs = processes.pgcat.current_config
-        new_configs["general"]["connect_timeout"] = 500
+        new_configs["general"]["fetch_timeout"] = 500
         new_configs["general"]["ban_time"] = 1
         new_configs["general"]["shutdown_timeout"] = 1
         new_configs["pools"]["sharded_db"]["checkout_failure_limit"] = 100
@@ -163,7 +163,7 @@ describe "Stats" do
         threads = []
         connections = Array.new(5) { PG::connect("#{pgcat_conn_str}?application_name=one_query") }
         connections.each do |c|
-          threads << Thread.new { c.async_exec("SELECT pg_sleep(1)") rescue PG::SystemError }
+          threads << Thread.new { c.async_exec("SELECT pg_sleep(1)") rescue PG::Error }
         end
 
         sleep(15)
@@ -375,9 +375,10 @@ describe "Stats" do
       it "should not have lingering clients or active servers" do
         new_configs = processes.pgcat.current_config
 
-        new_configs["general"]["connect_timeout"] = 500
+        new_configs["general"]["fetch_timeout"] = 500
         new_configs["general"]["ban_time"] = 1
         new_configs["general"]["shutdown_timeout"] = 1
+        new_configs["pools"]["sharded_db"]["checkout_failure_limit"] = 1
         new_configs["pools"]["sharded_db"]["users"]["0"]["pool_size"] = 1
         processes.pgcat.update_config(new_configs)
         processes.pgcat.reload_config
@@ -386,7 +387,7 @@ describe "Stats" do
           Thread.new do
             conn = PG.connect(processes.pgcat.connection_string("sharded_db", "sharding_user"))
             conn.async_exec("SELECT pg_sleep(0.1)")
-          rescue PG::SystemError
+          rescue PG::Error
           ensure
             conn.close
           end

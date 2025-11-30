@@ -58,7 +58,15 @@ describe "Random Load Balancing" do
   end
 
   context "when all replicas are down " do
-    let(:processes) { Helpers::Pgcat.single_shard_setup("sharded_db", 5, "transaction", "random", "debug", {"default_role" => "replica"}) }
+    let(:processes) {
+      struct = Helpers::Pgcat.single_shard_setup("sharded_db", 5, "transaction", "random", "debug", {"default_role" => "replica"})
+      cfg = struct.pgcat.current_config
+      cfg["general"]["healthcheck_timeout"] = 100
+      cfg["pools"]["sharded_db"]["fetch_timeout"] = 100
+      struct.pgcat.update_config(cfg)
+      struct.pgcat.reload_config
+      struct
+    }
 
     it "unbans them automatically to prevent false positives in health checks that could make all replicas unavailable" do
       conn = PG.connect(processes.pgcat.connection_string("sharded_db", "sharding_user"))

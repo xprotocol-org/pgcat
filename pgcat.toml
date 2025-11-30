@@ -18,7 +18,7 @@ enable_prometheus_exporter = true
 prometheus_exporter_port = 9930
 
 # How long to wait before aborting a server connection (ms).
-connect_timeout = 5000 # milliseconds
+fetch_timeout = 5000 # milliseconds
 
 # How long an idle connection with a server is left open (ms).
 idle_timeout = 30000 # milliseconds
@@ -217,7 +217,7 @@ sharding_function = "pg_bigint_hash"
 idle_timeout = 40000
 
 # Connect timeout can be overwritten in the pool
-connect_timeout = 3000
+fetch_timeout = 3000
 
 # When enabled, ip resolutions for server connections specified using hostnames will be cached
 # and checked for changes every `dns_max_ttl` seconds. If a change in the host resolution is found
@@ -308,7 +308,7 @@ username = "other_user"
 password = "other_user"
 pool_size = 21
 statement_timeout = 15000
-connect_timeout = 1000
+fetch_timeout = 1000
 idle_timeout = 1000
 
 # Shard configs are structured as pool.<pool_name>.shards.<shard_id>

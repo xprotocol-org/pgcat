@@ -60,8 +60,11 @@ CREATE ROLE other_user ENCRYPTED PASSWORD 'other_user' LOGIN;
 CREATE ROLE simple_user ENCRYPTED PASSWORD 'simple_user' LOGIN;
 
 GRANT CONNECT ON DATABASE shard0  TO sharding_user;
+GRANT CREATE ON DATABASE shard0 TO sharding_user;
 GRANT CONNECT ON DATABASE shard1  TO sharding_user;
+GRANT CREATE ON DATABASE shard1 TO sharding_user;
 GRANT CONNECT ON DATABASE shard2  TO sharding_user;
+GRANT CREATE ON DATABASE shard2 TO sharding_user;
 
 GRANT CONNECT ON DATABASE shard0  TO other_user;
 GRANT CONNECT ON DATABASE shard1  TO other_user;

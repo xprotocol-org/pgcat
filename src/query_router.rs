@@ -1,7 +1,7 @@
 /// Route queries automatically based on explicitly requested
 /// or implied query characteristics.
 use bytes::{Buf, BytesMut};
-use log::{debug, error};
+use log::{debug, error, warn};
 use mini_moka::sync::Cache;
 use once_cell::sync::OnceCell;
 use regex::{Regex, RegexSet};
@@ -119,7 +119,7 @@ pub struct QueryRouter {
     primary_reads_enabled: Option<bool>,
 
     /// Pool configuration.
-    pool_settings: PoolSettings,
+    pub pool_settings: PoolSettings,
 
     // Placeholders from prepared statement.
     placeholders: Vec<i16>,
@@ -317,6 +317,14 @@ impl QueryRouter {
 
     pub fn pool_settings(&self) -> &PoolSettings {
         &self.pool_settings
+    }
+
+    pub fn set_role(&mut self, role: Role) {
+        self.active_role = Some(role);
+    }
+
+    pub fn reset_role(&mut self) {
+        self.active_role = None;
     }
 
     /// Try to parse a command and execute it.
@@ -622,7 +630,10 @@ impl QueryRouter {
             return Ok(()); // Nothing to do
         }
 
-        debug!("Inferring role");
+        debug!("Inferring role. Current active_role: {:?}", self.active_role);
+
+        // Reset active_role to ensure we don't carry over previous state (e.g. from a parse error)
+        self.active_role = None;
 
         if ast.is_empty() {
             // That's weird, no idea, let's go to primary
@@ -694,10 +705,13 @@ impl QueryRouter {
                         self.active_role = Some(Role::Primary);
                     } else if !visited_write_statement {
                         // If we already visited a write statement, we should be going to the primary.
-                        self.active_role = match self.primary_reads_enabled() {
+                        let primary_reads = self.primary_reads_enabled();
+                        warn!("DEBUG: Read query. Primary reads enabled: {}", primary_reads);
+                        self.active_role = match primary_reads {
                             false => Some(Role::Replica), // If primary should not be receiving reads, use a replica.
                             true => None,                 // Any server role is fine in this case.
-                        }
+                        };
+                        warn!("DEBUG: Set active_role to: {:?}", self.active_role);
                     }
                 }
 
@@ -1384,7 +1398,11 @@ impl QueryRouter {
 
     /// Set active_role as the default_role specified in the pool.
     pub fn set_default_role(&mut self) {
-        self.active_role = self.pool_settings.default_role;
+        if self.pool_settings.query_parser_read_write_splitting {
+            self.set_role(Role::Primary);
+        } else {
+            self.active_role = self.pool_settings.default_role;
+        }
     }
 
     /// Get the current desired server role we should be talking to.
@@ -2759,6 +2777,27 @@ mod test {
         qr.active_role = None; // Reset the active_role
         assert!(qr.infer(&ast).is_ok());
         // Should route to replica because mutation cache has expired
+        assert_eq!(qr.role(), None);
+    }
+    #[test]
+    fn test_set_role_and_infer_overwrite() {
+        use crate::messages::simple_query;
+        QueryRouter::setup();
+        let mut qr = QueryRouter::new();
+        qr.pool_settings.query_parser_read_write_splitting = true;
+
+        // 1. Explicitly set role to Primary (simulating parse failure fallback)
+        qr.set_role(Role::Primary);
+        assert_eq!(qr.role(), Some(Role::Primary));
+
+        // 2. Infer role from a read-only query
+        // This should overwrite the explicit Primary role because splitting is enabled
+        let query = simple_query("SELECT 1");
+        let ast = qr.parse(&query).unwrap();
+        qr.infer(&ast).unwrap();
+
+        // Expectation: Role should be None (meaning "any" or "replica" depending on config, but definitely not forced Primary)
+        // In default config with splitting enabled, read query -> None (load balance)
         assert_eq!(qr.role(), None);
     }
 }
