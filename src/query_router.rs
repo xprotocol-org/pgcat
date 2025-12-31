@@ -706,12 +706,12 @@ impl QueryRouter {
                     } else if !visited_write_statement {
                         // If we already visited a write statement, we should be going to the primary.
                         let primary_reads = self.primary_reads_enabled();
-                        warn!("DEBUG: Read query. Primary reads enabled: {}", primary_reads);
+                        debug!("Read query. Primary reads enabled: {}", primary_reads);
                         self.active_role = match primary_reads {
                             false => Some(Role::Replica), // If primary should not be receiving reads, use a replica.
                             true => None,                 // Any server role is fine in this case.
                         };
-                        warn!("DEBUG: Set active_role to: {:?}", self.active_role);
+                        debug!("Set active_role to: {:?}", self.active_role);
                     }
                 }
 

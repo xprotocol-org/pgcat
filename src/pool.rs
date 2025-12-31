@@ -1004,7 +1004,7 @@ impl ConnectionPool {
         role: Option<Role>,         // primary or replica
         client_stats: &ClientStats, // client id
     ) -> Result<(PooledConnection<'_, ServerPool>, Address), Error> {
-        eprintln!("DEBUG: pool.get called with role: {:?}", role);
+        debug!("pool.get called with role: {:?}", role);
         if !self.validated() {
             self.validate().await?;
         }
@@ -1027,7 +1027,7 @@ impl ConnectionPool {
             .filter(|address| {
                 let matched = address.role == role;
                 if matched {
-                     eprintln!("DEBUG: Candidate found: {:?} matching role {:?}", address, role);
+                    debug!("Candidate found: {:?} matching role {:?}", address, role);
                 }
                 matched
             })

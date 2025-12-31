@@ -1123,7 +1123,7 @@ where
 
             let mut checkout_failure_count = 0;
             let (mut reference, address) = loop {
-                warn!("DEBUG: pool.get called with shard: {:?}, role: {:?}", query_router.shard(), query_router.role());
+                debug!("pool.get called with shard: {:?}, role: {:?}", query_router.shard(), query_router.role());
                 if checkout_failure_count >= checkout_limit {
                     error!(
                         "Checkout failure limit reached ({} / {}) - disconnecting client",
