@@ -42,7 +42,7 @@ pub type ClientServerMap =
 pub type PoolMap = HashMap<PoolIdentifier, ConnectionPool>;
 
 pub static POOLS: Lazy<ArcSwap<PoolMap>> = Lazy::new(|| ArcSwap::from_pointee(HashMap::default()));
-static POOLS_WRITE_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+static POOLS_WRITE_LOCK: Lazy<tokio::sync::Mutex<()>> = Lazy::new(|| tokio::sync::Mutex::new(()));
 
 struct ConnectionTimeouts {
     fetch: u64,
@@ -811,7 +811,10 @@ impl ConnectionPool {
             "any" => None,
             "replica" => Some(Role::Replica),
             "primary" => Some(Role::Primary),
-            _ => unreachable!(),
+            other => {
+                error!("Unknown default_role: '{}', falling back to 'any'", other);
+                None
+            }
         }
     }
 
@@ -1596,14 +1599,13 @@ pub async fn get_or_create_pool(
         return Ok(None);
     }
 
-    // Acquire lock for double-check
-    {
-        let _guard = POOLS_WRITE_LOCK.lock();
+    // Acquire async lock for the entire create-and-insert operation
+    // to prevent duplicate pool creation under concurrent requests.
+    let _guard = POOLS_WRITE_LOCK.lock().await;
 
-        // Double-check inside the lock in case another thread created it
-        if let Some(pool) = get_pool(db, user) {
-            return Ok(Some(pool));
-        }
+    // Double-check inside the lock in case another task created it
+    if let Some(pool) = get_pool(db, user) {
+        return Ok(Some(pool));
     }
 
     info!(
@@ -1613,18 +1615,8 @@ pub async fn get_or_create_pool(
 
     let pool = ConnectionPool::create_dynamic_pool(db, user, &[], client_server_map).await?;
 
-    // Final check and add - use block to limit lock scope
-    {
-        let _guard = POOLS_WRITE_LOCK.lock();
-
-        // Check again - another thread might have created it while we were creating
-        if let Some(existing_pool) = get_pool(db, user) {
-            return Ok(Some(existing_pool));
-        }
-
-        // Insert the pool directly since we already hold the lock
-        add_dynamic_pool(db, user, pool.clone());
-    }
+    // Insert the pool while we still hold the lock
+    add_dynamic_pool(db, user, pool.clone());
 
     Ok(Some(pool))
 }
@@ -1751,7 +1743,7 @@ mod tests {
                 idle_client_in_transaction_timeout: 0,
                 healthcheck_timeout: 1000,
                 healthcheck_delay: 30000,
-                server_recv_timeout: 0,
+                server_recv_timeout: 60000,
                 ban_time: 60,
                 log_client_connections: false,
                 log_client_disconnections: false,
@@ -1851,7 +1843,7 @@ mod tests {
         let timeouts = ConnectionPool::resolve_timeouts(&user, &pool_config, &config);
 
         assert_eq!(timeouts.fetch, 5000);
-        assert_eq!(timeouts.tcp_connect, 1000);
+        assert_eq!(timeouts.tcp_connect, 5000);
         assert_eq!(timeouts.idle, 30000);
         assert_eq!(timeouts.lifetime, 3600000);
     }

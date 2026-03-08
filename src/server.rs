@@ -156,6 +156,7 @@ static TRACKED_PARAMETERS: Lazy<HashSet<String>> = Lazy::new(|| {
     set.insert("TimeZone".to_string());
     set.insert("standard_conforming_strings".to_string());
     set.insert("application_name".to_string());
+    set.insert("search_path".to_string());
     set
 });
 
@@ -218,8 +219,13 @@ impl ServerParameters {
         // iterate through tracked parameters
         for key in TRACKED_PARAMETERS.iter() {
             if let Some(incoming_value) = incoming_parameters.parameters.get(key) {
-                if let Some(value) = self.parameters.get(key) {
-                    if value != incoming_value {
+                match self.parameters.get(key) {
+                    Some(value) if value == incoming_value => {
+                        // Values match, no sync needed
+                    }
+                    _ => {
+                        // Either the server doesn't have this parameter at all,
+                        // or it has a different value — sync needed
                         diff.insert(key.to_string(), incoming_value.to_string());
                     }
                 }
@@ -229,9 +235,11 @@ impl ServerParameters {
         diff
     }
 
-    pub fn get_application_name(&self) -> &String {
-        // Can unwrap because we set it in the constructor
-        self.parameters.get("application_name").unwrap()
+    pub fn get_application_name(&self) -> &str {
+        static DEFAULT_APP_NAME: String = String::new();
+        self.parameters
+            .get("application_name")
+            .unwrap_or(&DEFAULT_APP_NAME)
     }
 
     fn add_parameter_message(key: &str, value: &str, buffer: &mut BytesMut) {
@@ -1170,13 +1178,10 @@ impl Server {
             };
         }
 
-        let bytes = self.buffer.clone();
+        let bytes = std::mem::replace(&mut self.buffer, BytesMut::with_capacity(8196));
 
         // Keep track of how much data we got from the server for stats.
         self.stats().data_received(bytes.len());
-
-        // Clear the buffer for next query.
-        self.buffer.clear();
 
         // Successfully received data from server
         self.last_activity = SystemTime::now();
@@ -1490,6 +1495,8 @@ impl Server {
         for (key, value) in parameter_diff {
             query.push_str(&format!("SET {} TO '{}';", key, value));
         }
+
+        debug!("Syncing parameters: {}", query);
 
         let res = self.query(&query).await;
 

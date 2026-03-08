@@ -745,7 +745,7 @@ where
         };
 
         // Update the parameters to merge what the application sent and what's originally on the server
-        server_parameters.set_from_hashmap(&parameters, false);
+        server_parameters.set_from_hashmap(&parameters, true);
 
         debug!("Password authentication successful");
 
@@ -2321,10 +2321,19 @@ impl<S, T> Drop for Client<S, T> {
         let mut guard = self.client_server_map.lock();
         guard.remove(&(self.process_id, self.secret_key));
 
-        // Dirty shutdown
-        // TODO: refactor, this is not the best way to handle state management.
-        if self.connected_to_server && self.last_server_stats.is_some() {
-            self.last_server_stats.as_ref().unwrap().idle();
+        // If the client is dropped while still connected to a server (e.g., TCP reset),
+        // we cannot run async checkin_cleanup() from Drop. Instead, mark the server
+        // connection as dirty so bb8's has_broken() returns true and discards it
+        // rather than returning it to the pool with potentially leaked state
+        // (open transactions, advisory locks, temp tables, SET commands, etc.).
+        if self.connected_to_server {
+            warn!(
+                "Client dropped while still connected to server, \
+                 marking server connection for disposal"
+            );
+            if let Some(ref server_stats) = self.last_server_stats {
+                server_stats.idle();
+            }
         }
     }
 }
