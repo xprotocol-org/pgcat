@@ -1222,8 +1222,17 @@ impl ConnectionPool {
             _ => (),
         };
 
-        // Primary can never be banned
+        // Primary can never be banned, but we log clearly so operators
+        // know the primary is failing and can investigate.
         if address.role == Role::Primary {
+            error!(
+                "Primary server {:?} is failing (reason: {:?}), but primaries cannot be banned. \
+                 Consecutive errors: {}",
+                address,
+                reason,
+                address.error_count() + 1
+            );
+            address.increment_error_count();
             return;
         }
 
@@ -1550,9 +1559,14 @@ impl ManageConnection for ServerPool {
 
     fn is_valid(
         &self,
-        _conn: &mut Self::Connection,
+        conn: &mut Self::Connection,
     ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
-        async { Ok(()) }
+        // Perform a lightweight health check to verify the connection is alive.
+        // Currently test_on_check_out is false, so bb8 won't call this on checkout,
+        // but implementing it properly ensures correctness if that ever changes.
+        async {
+            conn.query(";").await
+        }
     }
 
     fn has_broken(&self, conn: &mut Self::Connection) -> bool {
